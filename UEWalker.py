@@ -14,6 +14,7 @@ import logging
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
@@ -392,7 +393,12 @@ class CUE4Parse:
             load("coreclr", **config)  # must precede `import clr`
             import clr
 
-            clr.AddReference(str(Path(CUE4PARSE_DLL).resolve()))
+            # AddReference resolves by assembly name off sys.path, not by file path:
+            # the publish directory goes on the path so the sibling dependency DLLs
+            # (Oodle, Serilog, Newtonsoft, ...) resolve from there too.
+            dll = Path(CUE4PARSE_DLL).resolve()
+            sys.path.append(str(dll.parent))
+            clr.AddReference(dll.stem)
 
             from CUE4Parse.Compression import OodleHelper  # noqa: PLC0415
             from CUE4Parse.FileProvider import DefaultFileProvider  # noqa: PLC0415

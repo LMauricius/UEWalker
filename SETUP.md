@@ -10,7 +10,7 @@ Four pieces are involved:
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `py7zr`                                 | reads the mod's `.7z` archives                                                                                | `pip install py7zr` ([PyPI](https://pypi.org/project/py7zr/))                                                                                 |
 | `retoc`                                 | converts IoStore containers (`.utoc`/`.ucas`) to legacy cooked assets, and back again for the write-back pass | [github.com/trumank/retoc](https://github.com/trumank/retoc) ([releases](https://github.com/trumank/retoc/releases), prebuilt Linux binaries) |
-| .NET 10 + `pythonnet` + `CUE4Parse.dll` | reads cooked `Texture2D` assets and hands their raw mips to Python                                            | no prebuilt CLI exists; build against [CUE4Parse](https://github.com/FabianFG/CUE4Parse).                                                     |
+| .NET 10 + `pythonnet` + `CUE4Parse.dll` | reads cooked `Texture2D` assets and hands their raw mips to Python                                            | the [CUE4Parse](https://www.nuget.org/packages/CUE4Parse) NuGet package ([source](https://github.com/FabianFG/CUE4Parse))                     |
 | Oodle                                   | decompresses UE 4.26 container data on CUE4Parse's behalf                                                     |                                                                                                                                               |
 
 `repak` is a fifth, optional piece: it is needed only if a mod ships a legacy `.pak`
@@ -39,14 +39,6 @@ Version 10 is what current CUE4Parse targets (`net10.0`). Keep the runtime in st
 whatever your copy was built for. Check the build's
 `bin/Release/` directory name if you are unsure.
 
-If your distribution does not package these, use Microsoft's installer script:
-
-```bash
-curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0
-export DOTNET_ROOT="$HOME/.dotnet"
-export PATH="$DOTNET_ROOT:$PATH"
-```
-
 Add those two exports to your shell profile; `pythonnet` locates the runtime through
 `DOTNET_ROOT`.
 
@@ -68,18 +60,43 @@ Make sure `~/.local/bin` is on your `PATH`. Newer releases live at
 
 ## 4. CUE4Parse
 
-Ideally build it once:
+CUE4Parse ships as a NuGet package.
+NuGet is .NET's package feed, the `pip` of that ecosystem, and
+the SDK talks to it for you. CUE4Parse is a DLL to be used by other .NET programs,
+and it is pulled as a dependency during the .NET app building process.
+Since this is a Python project, one awkward part is that a NuGet package is fetched into a
+shared cache rather than into a folder you can point at, so the job here is to make the
+SDK gather CUE4Parse and its dependencies into one directory of your choosing.
+
+An empty class library does that, since a project is what NuGet installs into:
 
 ```bash
-git clone --recursive https://github.com/FabianFG/CUE4Parse.git
-cd CUE4Parse
-dotnet build CUE4Parse/CUE4Parse.csproj -c Release
+dotnet new classlib -o cue4parse-fetch
+cd cue4parse-fetch
+dotnet add package CUE4Parse
+dotnet add package CUE4Parse-Conversion
+dotnet publish -c Release -o ./CUE4Parse -p:EnableDynamicLoading=true
 ```
 
-`--recursive` matters: CUE4Parse pulls its compression backends in as submodules. The
-build drops `CUE4Parse.dll` and its dependencies in
-`CUE4Parse/bin/Release/net10.0/`; that path goes into `CUE4PARSE_DLL`. Sibling DLLs in
-the same directory are resolved automatically, so do not move the file out on its own.
+Three details make that work:
+
+- `publish`, not `build`. It restores the packages and then copies every assembly next
+  to the output. `build` leaves the dependencies in the cache and gives you a lone
+  `CUE4Parse.dll`, which binds and then fails on the first type that needs one.
+- `-p:EnableDynamicLoading=true`. A class library otherwise publishes without a
+  runtimeconfig, and that file is what pins the .NET version to boot.
+- The project's own name. `dotnet new classlib` targets whichever framework your SDK
+  installs, so the versions stay consistent by themselves, and the runtimeconfig is
+  named after the project.
+
+Around 40 files land in the output directory. Two of them go into the config:
+`CUE4Parse.dll` into `CUE4PARSE_DLL`, and `cue4parse-fetch.runtimeconfig.json` into
+`DOTNET_RUNTIME_CONFIG`. The rest resolve automatically from that directory, so keep
+them together. The `cue4parse-fetch` project itself can be deleted; recreate it when you
+want a newer release, or just run the two `dotnet add package` lines again and republish.
+
+`checktools.py` reads the published `deps.json` and names any assembly that did not make
+it into the directory.
 
 ## 5. Oodle
 
@@ -121,13 +138,13 @@ MOD_ROOT      = "/path/to/mod"
 OUT_DIR       = "/path/to/output"
 RETOC_PATH    = "retoc"                                   # or an absolute path
 REPAK_PATH    = "repak"
-CUE4PARSE_DLL = "/home/you/src/CUE4Parse/CUE4Parse/bin/Release/net10.0/CUE4Parse.dll"
+CUE4PARSE_DLL = "/home/you/Programs/CUE4Parse/CUE4Parse.dll"   # a publish output; `~` is not expanded
 BACKUP        = False                                     # True keeps a backup- copy of each file
 OODLE_LIB     = None                                      # None = let CUE4Parse fetch it
 AES_KEY       = None                                      # mod containers are normally plain
 RETOC_VERSION = "UE4_26"
 UE_VERSION    = "GAME_UE4_26"
-DOTNET_RUNTIME_CONFIG = None   # or the CUE4Parse.runtimeconfig.json beside the DLL
+DOTNET_RUNTIME_CONFIG = "/home/you/Programs/CUE4Parse/cue4parse-fetch.runtimeconfig.json"
 ```
 
 `DOTNET_RUNTIME_CONFIG` matters when more than one .NET runtime is installed (having

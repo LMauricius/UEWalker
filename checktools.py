@@ -11,6 +11,7 @@ container check) report `skip` instead of failing.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -103,8 +104,24 @@ def check_retoc() -> str:
     return tool_version(path)
 
 
-#: Assemblies CUE4Parse is built against that ship as separate files beside it.
-CUE4PARSE_DEPS = ("OodleDotNet", "ZstdSharp", "Newtonsoft.Json", "Serilog", "SkiaSharp")
+def missing_dependencies(deps_json: Path) -> list[str]:
+    """
+    Dependency assemblies named by a `.deps.json` that are not next to it.
+
+    A plain `dotnet build` writes the manifest but leaves the packages in the NuGet
+    cache, so the manifest is the only reliable way to tell a build output from a
+    publish output.
+    """
+    manifest = json.loads(deps_json.read_text())
+    wanted: set[str] = set()
+    for target in manifest.get("targets", {}).values():
+        for library in target.values():
+            wanted.update(Path(f).name for f in library.get("runtime", {}))
+    return sorted(
+        name
+        for name in wanted
+        if name.endswith(".dll") and not (deps_json.parent / name).is_file()
+    )
 
 
 def target_framework(dll: Path) -> str:
@@ -122,8 +139,9 @@ def check_dotnet_layout() -> str:
     """
     The .NET side before any CLR boot: a runtime to host the DLL, and its siblings.
 
-    `clr.AddReference` succeeds on a lone assembly and only fails later, deep in a
-    type load, so the publish output is checked for completeness here instead.
+    `clr.AddReference` resolves dependencies from the DLL's own directory and only
+    fails once a type actually needs one, so the directory is checked for completeness
+    here instead.
     """
     dll = Path(CUE4PARSE_DLL)
     if not dll.is_file():
@@ -133,18 +151,30 @@ def check_dotnet_layout() -> str:
     problems = []
     if shutil.which("dotnet") is None:
         problems.append("no `dotnet` on PATH: install the runtime matching " + framework)
-    if not dll.with_suffix(".deps.json").is_file():
-        missing = [d for d in CUE4PARSE_DEPS if not (dll.parent / f"{d}.dll").is_file()]
+
+    # The manifest is named after whichever project pulled CUE4Parse in, not after
+    # CUE4Parse itself, so any *.deps.json in the directory is the right one.
+    manifests = sorted(dll.parent.glob("*.deps.json"))
+    if not manifests:
         problems.append(
-            "no CUE4Parse.deps.json beside the DLL"
-            + (f", and no {', '.join(missing)}" if missing else "")
-            + ": copy the whole `dotnet publish` output directory, not just the one file"
+            "no *.deps.json beside the DLL: copy the whole `dotnet publish` output "
+            "directory, not just the one file"
         )
+    else:
+        absent = missing_dependencies(manifests[0])
+        if absent:
+            shown = ", ".join(absent[:4]) + (f", +{len(absent) - 4} more" if len(absent) > 4 else "")
+            problems.append(
+                f"{len(absent)} dependency assemblies missing ({shown}): this is a "
+                f"`dotnet build` output, which leaves them in the NuGet cache. Re-run as "
+                f"`dotnet publish -c Release -o <dir>` and point CUE4PARSE_DLL at <dir>"
+            )
+
     if DOTNET_RUNTIME_CONFIG and not Path(DOTNET_RUNTIME_CONFIG).is_file():
         problems.append(f"DOTNET_RUNTIME_CONFIG missing: {DOTNET_RUNTIME_CONFIG}")
     if problems:
         raise RuntimeError("; ".join(problems))
-    return framework
+    return f"{framework}, dependencies complete"
 
 
 def check_cue4parse() -> str:
