@@ -379,59 +379,35 @@ class CUE4Parse:
         if cls._types is not None:
             return cls._types
 
-        # Booting the CLR, binding the assembly and resolving its types either all
-        # work or the decoder is unusable for every asset: report once, fatally.
-        foundRuntime = False
-        foundRuntimeName = ""
-        for runtimeName in ["coreclr", "mono", "netfx"]:
-            try:
-                log.debug("trying %s", runtimeName)
-                from pythonnet import load
+        # coreclr only. CUE4Parse is built for .NETCoreApp, and Mono's BCL cannot
+        # resolve its System.Runtime reference, so a fallback chain would only turn a
+        # clear "no runtime installed" into a confusing type-resolution error. Booting
+        # the CLR, binding the assembly and resolving its types either all work or the
+        # decoder is unusable for every asset: report once, fatally.
+        try:
+            from pythonnet import load
 
-                load(runtimeName)  # must precede `import clr`
-                import clr
+            # The runtime config names the exact .NET version the assembly wants.
+            config = {"runtime_config": DOTNET_RUNTIME_CONFIG} if DOTNET_RUNTIME_CONFIG else {}
+            load("coreclr", **config)  # must precede `import clr`
+            import clr
 
-                clr.AddReference(str(Path(CUE4PARSE_DLL).resolve()))
+            clr.AddReference(str(Path(CUE4PARSE_DLL).resolve()))
 
-                from CUE4Parse.Compression import OodleHelper  # noqa: PLC0415
-                from CUE4Parse.FileProvider import DefaultFileProvider  # noqa: PLC0415
-                from CUE4Parse.UE4.Versions import (
-                    EGame,
-                    VersionContainer,
-                )  # noqa: PLC0415
-                from System.IO import SearchOption  # noqa: PLC0415
+            from CUE4Parse.Compression import OodleHelper  # noqa: PLC0415
+            from CUE4Parse.FileProvider import DefaultFileProvider  # noqa: PLC0415
+            from CUE4Parse.UE4.Versions import EGame, VersionContainer  # noqa: PLC0415
+            from System.IO import SearchOption  # noqa: PLC0415
 
-                # UE 4.26 container data is Oodle-compressed. With no path given, CUE4Parse
-                # downloads an open-source Oodle build once and caches it next to the DLL.
-                OodleHelper.Initialize(OODLE_LIB)
-
-                foundRuntime = True
-                foundRuntimeName = runtimeName
-                break
-                # Found the runtime setup, end the loop
-            except Exception as exc:
-                log.error(
-                    "cannot load CUE4Parse using '%s' from %r: %s",
-                    runtimeName,
-                    CUE4PARSE_DLL,
-                    exc,
-                )
-
-        log.info("tried all .NET runtimes ")
-
-        from pythonnet import get_runtime_info
-
-        if not foundRuntime:
+            # UE 4.26 container data is Oodle-compressed. With no path given, CUE4Parse
+            # downloads an open-source Oodle build once and caches it next to the DLL.
+            OodleHelper.Initialize(OODLE_LIB)
+        except Exception as exc:
+            log.error("cannot load CUE4Parse from %r: %s", CUE4PARSE_DLL, exc)
             raise ToolError(
-                f"cannot load CUE4Parse; .NET runtime info: {get_runtime_info()}"
-            )
-        else:
-            log.info(
-                "loaded CUE4Parse using '%s' from %r: .NET runtime info: '%s'",
-                foundRuntimeName,
-                CUE4PARSE_DLL,
-                get_runtime_info(),
-            )
+                f"cannot load CUE4Parse: {exc}. Run `python checktools.py` for a "
+                f"breakdown of what the .NET side is missing."
+            ) from exc
 
         cls._types = {
             "DefaultFileProvider": DefaultFileProvider,

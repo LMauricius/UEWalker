@@ -103,6 +103,50 @@ def check_retoc() -> str:
     return tool_version(path)
 
 
+#: Assemblies CUE4Parse is built against that ship as separate files beside it.
+CUE4PARSE_DEPS = ("OodleDotNet", "ZstdSharp", "Newtonsoft.Json", "Serilog", "SkiaSharp")
+
+
+def target_framework(dll: Path) -> str:
+    """Framework moniker baked into an assembly, e.g. `.NETCoreApp,Version=v10.0`."""
+    blob = dll.read_bytes()
+    marker = b".NETCoreApp,Version=v"
+    at = blob.find(marker)
+    if at < 0:
+        return "unknown (not a .NETCoreApp assembly?)"
+    end = blob.index(b"\0", at)
+    return blob[at:end].decode("ascii", "replace")
+
+
+def check_dotnet_layout() -> str:
+    """
+    The .NET side before any CLR boot: a runtime to host the DLL, and its siblings.
+
+    `clr.AddReference` succeeds on a lone assembly and only fails later, deep in a
+    type load, so the publish output is checked for completeness here instead.
+    """
+    dll = Path(CUE4PARSE_DLL)
+    if not dll.is_file():
+        raise RuntimeError(f"{CUE4PARSE_DLL} does not exist")
+    framework = target_framework(dll)
+
+    problems = []
+    if shutil.which("dotnet") is None:
+        problems.append("no `dotnet` on PATH: install the runtime matching " + framework)
+    if not dll.with_suffix(".deps.json").is_file():
+        missing = [d for d in CUE4PARSE_DEPS if not (dll.parent / f"{d}.dll").is_file()]
+        problems.append(
+            "no CUE4Parse.deps.json beside the DLL"
+            + (f", and no {', '.join(missing)}" if missing else "")
+            + ": copy the whole `dotnet publish` output directory, not just the one file"
+        )
+    if DOTNET_RUNTIME_CONFIG and not Path(DOTNET_RUNTIME_CONFIG).is_file():
+        problems.append(f"DOTNET_RUNTIME_CONFIG missing: {DOTNET_RUNTIME_CONFIG}")
+    if problems:
+        raise RuntimeError("; ".join(problems))
+    return framework
+
+
 def check_cue4parse() -> str:
     """Boot the CLR, bind CUE4Parse, and resolve the configured EGame member."""
     t = W.CUE4Parse.types()
@@ -158,6 +202,7 @@ def main() -> int:
         check("retoc", check_retoc)
         optional("repak (only for .pak-only sets)",
                  lambda: tool_version(W.require_tool(REPAK_PATH, "repak")))
+        check(".NET layout", check_dotnet_layout)
         check("CUE4Parse", check_cue4parse)
         check("DDS writer", check_dds_writer)
         if utoc is None:
