@@ -302,23 +302,11 @@ class UEContainerSource(ArchiveSource):
     def extract(self, members: list[str], dest: Path) -> None:
         """`members` is ignored: the whole container is converted/unpacked into `dest`."""
         dest.mkdir(parents=True, exist_ok=True)
-        log.debug("unpacking container set %s -> %s", self.set_dir, dest)
 
         # retoc reads the .ucas alongside its .utoc, so only the index file is named.
         utoc = next(self.set_dir.rglob("*.utoc"), None)
         if utoc is not None:
-            # to-legacy, not unpack: `unpack` yields Zen-format assets, while legacy
-            # .uasset/.uexp can still be rewritten when an edit changes a texture's
-            # size. `retoc to-zen --version` reverses this exactly on the way back.
-            # -a is a global option and must precede the subcommand.
-            run_tool([
-                RETOC_PATH,
-                *(["-a", AES_KEY] if AES_KEY else []),
-                "to-legacy",
-                "--version", RETOC_VERSION,
-                str(utoc),
-                str(dest),
-            ])
+            self._from_iostore(utoc, dest)
             return
 
         # No .utoc: the set is already legacy, and retoc speaks IoStore only.
@@ -326,6 +314,33 @@ class UEContainerSource(ArchiveSource):
         if pak is None:
             raise RuntimeError(f"no .pak/.utoc found in {self.set_dir}")
         run_tool([REPAK_PATH, "unpack", "-o", str(dest), str(pak)])
+
+    @staticmethod
+    def _from_iostore(utoc: Path, dest: Path) -> None:
+        """
+        Get assets out of an IoStore container, preferring the legacy conversion.
+
+        `to-legacy` is tried first: it emits legacy .uasset/.uexp, which can still be
+        rewritten when an edit changes a texture's size, and `retoc to-zen` reverses
+        it. It resolves package names through the container header, though, and
+        mod-authored containers frequently ship one retoc cannot parse -- it then
+        reports `packages: 0` and silently writes nothing at all.
+
+        `unpack` is the fallback: it works off the directory index instead, which
+        survives in those containers, at the cost of emitting Zen-format assets.
+        """
+        aes = ["-a", AES_KEY] if AES_KEY else []
+        # -a is a global option and must precede the subcommand.
+        run_tool([RETOC_PATH, *aes, "to-legacy", "--version", RETOC_VERSION,
+                  str(utoc), str(dest)])
+        if any(dest.rglob("*.uasset")):
+            return
+
+        log.info(
+            "%s: to-legacy produced no packages (unparsable container header?), "
+            "falling back to unpack", utoc.name,
+        )
+        run_tool([RETOC_PATH, *aes, "unpack", str(utoc), str(dest)])
 
 
 class CUE4Parse:
