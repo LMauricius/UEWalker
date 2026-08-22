@@ -215,6 +215,10 @@ class UEContainerSource(ArchiveSource):
             raise RuntimeError(f"no .pak/.utoc found in {self.set_dir}")
 
     # -- tool seams ---------------------------------------------------------
+    # TODO: pick and verify the actual UE unpacking tools. The retoc/repak calls below
+    # are placeholder shapes: subcommands, flag names and the IoStore -> legacy .pak
+    # step are all unconfirmed. Candidates to evaluate: retoc, repak, ZenTools,
+    # FModel/CUE4Parse. Nothing downstream of here works until this is settled.
 
     @staticmethod
     def _utoc_to_pak(utoc: Path, out_pak: Path) -> None:
