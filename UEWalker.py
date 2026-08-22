@@ -9,8 +9,10 @@ that is yielded. See `ModWalker` / `fileIterator` for the public entry points.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
+import struct
 import subprocess
 import tempfile
 from abc import ABC, abstractmethod
@@ -36,16 +38,26 @@ OUT_DIR = "/path/to/output"
 #: https://github.com/trumank/retoc/releases
 RETOC_PATH = "retoc"
 
-#: CUE4Parse-based texture decoder. Dumps raw mips as .dds plus a .dds.json sidecar
-#: describing pixel format and mip layout, which is what makes the edit reversible.
-#: No prebuilt CLI exists; build a small .NET console app against the library:
-#: https://github.com/FabianFG/CUE4Parse (FModel, its GUI: https://fmodel.app)
-DECODER_PATH = "cue4parse-cli"
+#: Legacy .pak unpacker, needed only for sets that have no .utoc; retoc handles
+#: IoStore only. Leave as-is if the mod ships pure IoStore containers.
+#: https://github.com/trumank/repak/releases
+REPAK_PATH = "repak"
+
+#: CUE4Parse.dll, loaded in-process through pythonnet. Build it with
+#: `dotnet build -c Release`; sibling dependency DLLs are resolved from the same
+#: directory. https://github.com/FabianFG/CUE4Parse (FModel, its GUI: https://fmodel.app)
+CUE4PARSE_DLL = "/path/to/CUE4Parse.dll"
 
 #: AES key for encrypted containers. Mod-authored containers are normally plain.
 AES_KEY: str | None = None
 
-#: Engine version passed to the decoder; cooked assets are not self-describing.
+#: Oodle library (`liboodle-data-shared.so`). None lets CUE4Parse fetch an
+#: open-source build itself on first use: https://github.com/WorkingRobot/OodleUE
+OODLE_LIB: str | None = None
+
+#: Engine version. Cooked assets are not self-describing, and the two tools spell
+#: it differently: retoc takes `UE4_26`, CUE4Parse takes the `EGame` member name.
+RETOC_VERSION = "UE4_26"
 UE_VERSION = "GAME_UE4_26"
 
 # ---------------------------------------------------------------------------
@@ -58,6 +70,24 @@ UE_EXTS = {".pak", ".ucas", ".utoc"}
 
 #: Subdirectory of a container's output bundle holding the unpacked cooked assets.
 COOKED_DIR = "_cooked"
+
+# UE pixel format -> (DXGI format, bytes per 4x4 block, block-compressed?).
+# Only the formats game textures actually ship in; anything else is skipped loudly.
+PIXEL_FORMATS = {
+    "PF_DXT1":       (71, 8, True),    # BC1_UNORM
+    "PF_DXT3":       (74, 16, True),   # BC2_UNORM
+    "PF_DXT5":       (77, 16, True),   # BC3_UNORM
+    "PF_BC4":        (80, 8, True),    # BC4_UNORM
+    "PF_BC5":        (83, 16, True),   # BC5_UNORM
+    "PF_BC7":        (98, 16, True),   # BC7_UNORM
+    "PF_B8G8R8A8":   (87, 4, False),   # B8G8R8A8_UNORM
+    "PF_R8G8B8A8":   (28, 4, False),   # R8G8B8A8_UNORM
+    "PF_G8":         (61, 1, False),   # R8_UNORM
+    "PF_FloatRGBA":  (10, 8, False),   # R16G16B16A16_FLOAT
+}
+
+DDS_MAGIC = b"DDS "
+DDS_HEADER_SIZE = 124  # bytes after the magic, excluding the DX10 extension
 
 # Which container member represents the set in the output path, most specific first.
 UE_REPRESENTATIVE_ORDER = (".ucas", ".pak", ".utoc")
@@ -114,15 +144,17 @@ def work_dir(parent: Path) -> Iterator[Path]:
 
 
 def require_tools() -> None:
-    """Fail early, and by name, if a configured external tool is not on PATH."""
-    for label, tool in (
-        ("container unpacker", RETOC_PATH),
-        ("texture decoder", DECODER_PATH),
-    ):
-        if shutil.which(tool) is None and not Path(tool).is_file():
-            raise FileNotFoundError(
-                f"{label} not found: {tool!r} (see the globals at the top)"
-            )
+    """Fail early, and by name, if a configured dependency is missing."""
+    if shutil.which(RETOC_PATH) is None and not Path(RETOC_PATH).is_file():
+        raise FileNotFoundError(
+            f"container unpacker not found: {RETOC_PATH!r} (see the globals at the top)"
+        )
+    if not Path(CUE4PARSE_DLL).is_file():
+        raise FileNotFoundError(
+            f"CUE4Parse.dll not found: {CUE4PARSE_DLL!r} (see the globals at the top)"
+        )
+    # REPAK_PATH is deliberately not checked: it is only reached by a .pak-only set,
+    # and pure-IoStore mods never need it.
 
 
 def run_tool(argv: list[str]) -> None:
@@ -133,6 +165,36 @@ def run_tool(argv: list[str]) -> None:
         raise RuntimeError(
             f"{argv[0]} failed ({proc.returncode}): {detail[-1] if detail else 'no output'}"
         )
+
+
+def dds_bytes(pixel_format: str, width: int, height: int, mips: list[bytes]) -> bytes:
+    """
+    Pack raw mip payloads into a DDS with a DX10 header.
+
+    Mip bytes are written through untouched: this is a container swap, not a
+    re-encode, so the edit stays reversible against the cooked original.
+    """
+    dxgi, block, compressed = PIXEL_FORMATS[pixel_format]
+
+    # DDSD_CAPS|HEIGHT|WIDTH|PIXELFORMAT|MIPMAPCOUNT, plus LINEARSIZE or PITCH.
+    flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000
+    flags |= 0x80000 if compressed else 0x8
+    pitch = max(1, (width + 3) // 4) * block if compressed else width * block
+
+    # DDS_HEADER: 7 dwords, 44 reserved bytes, DDS_PIXELFORMAT (8 dwords),
+    # 4 caps dwords, 1 reserved dword. 128 bytes with the magic.
+    caps = 0x1000 | (0x400000 | 0x8 if len(mips) > 1 else 0)  # TEXTURE | MIPMAP|COMPLEX
+    header = struct.pack(
+        "<4sIIIIIII44sIIIIIIIIIIIII",
+        DDS_MAGIC, DDS_HEADER_SIZE, flags, height, width, pitch, 0, len(mips),
+        b"\0" * 44,                                        # dwReserved1
+        32, 0x4, int.from_bytes(b"DX10", "little"), 0, 0, 0, 0, 0,  # ddspf, DDPF_FOURCC
+        caps, 0, 0, 0,                                      # dwCaps1..4
+        0,                                                  # dwReserved2
+    )
+    # DDS_HEADER_DXT10: format, D3D10_RESOURCE_DIMENSION_TEXTURE2D, flags, 1 slice, flags2
+    header += struct.pack("<IIIII", dxgi, 3, 0, 1, 0)
+    return header + b"".join(mips)
 
 
 def images_under(root: Path) -> list[Path]:
@@ -236,8 +298,8 @@ class UEContainerSource(ArchiveSource):
     """
     A UE container set already materialised on disk, unpacked via retoc.
 
-    Always batch: retoc unpacks a whole container, so single-asset extraction is
-    not available at this layer. Output is cooked Zen assets (.uasset/.uexp/.ubulk),
+    Always batch: retoc converts a whole container, so single-asset extraction is
+    not available at this layer. Output is legacy cooked assets (.uasset/.uexp/.ubulk),
     not images; `TextureDecoder` handles the step after this one.
     """
 
@@ -251,55 +313,172 @@ class UEContainerSource(ArchiveSource):
         raise NotImplementedError("UE containers cannot be listed without unpacking")
 
     def extract(self, members: list[str], dest: Path) -> None:
-        """`members` is ignored: the whole container is unpacked into `dest`."""
-        # retoc reads the .ucas alongside its .utoc, so only the index file is named.
-        # A legacy .pak without an .utoc is passed directly.
-        entry = next(self.set_dir.rglob("*.utoc"), None) or next(
-            self.set_dir.rglob("*.pak"), None
-        )
-        if entry is None:
-            raise RuntimeError(f"no .pak/.utoc found in {self.set_dir}")
-
+        """`members` is ignored: the whole container is converted/unpacked into `dest`."""
         dest.mkdir(parents=True, exist_ok=True)
-        argv = [RETOC_PATH, "unpack", str(entry), str(dest)]
-        if AES_KEY:
-            argv += ["--aes-key", AES_KEY]
-        run_tool(argv)
+
+        # retoc reads the .ucas alongside its .utoc, so only the index file is named.
+        utoc = next(self.set_dir.rglob("*.utoc"), None)
+        if utoc is not None:
+            # to-legacy, not unpack: `unpack` yields Zen-format assets, while legacy
+            # .uasset/.uexp can still be rewritten when an edit changes a texture's
+            # size. `retoc to-zen --version` reverses this exactly on the way back.
+            # -a is a global option and must precede the subcommand.
+            run_tool([
+                RETOC_PATH,
+                *(["-a", AES_KEY] if AES_KEY else []),
+                "to-legacy",
+                "--version", RETOC_VERSION,
+                str(utoc),
+                str(dest),
+            ])
+            return
+
+        # No .utoc: the set is already legacy, and retoc speaks IoStore only.
+        pak = next(self.set_dir.rglob("*.pak"), None)
+        if pak is None:
+            raise RuntimeError(f"no .pak/.utoc found in {self.set_dir}")
+        run_tool([REPAK_PATH, "unpack", "-o", str(dest), str(pak)])
+
+
+class CUE4Parse:
+    """
+    Lazily loaded handle on the CUE4Parse assembly.
+
+    pythonnet boots the CLR once per process, so the imported types are cached at
+    module level. Loading is deferred until a container is actually reached: a walk
+    over a mod with no UE containers needs no .NET runtime at all.
+    """
+
+    _types: dict[str, object] | None = None
+
+    @classmethod
+    def types(cls) -> dict[str, object]:
+        """CUE4Parse types used below, keyed by name; loads the CLR on first call."""
+        if cls._types is not None:
+            return cls._types
+
+        from pythonnet import load
+
+        load("coreclr")  # must precede `import clr`
+        import clr
+
+        clr.AddReference(str(Path(CUE4PARSE_DLL).resolve()))
+
+        from CUE4Parse.Compression import OodleHelper  # noqa: PLC0415
+        from CUE4Parse.FileProvider import DefaultFileProvider  # noqa: PLC0415
+        from CUE4Parse.UE4.Versions import EGame, VersionContainer  # noqa: PLC0415
+        from System.IO import SearchOption  # noqa: PLC0415
+
+        # UE 4.26 container data is Oodle-compressed. With no path given, CUE4Parse
+        # downloads an open-source Oodle build once and caches it next to the DLL.
+        OodleHelper.Initialize(OODLE_LIB)
+
+        cls._types = {
+            "DefaultFileProvider": DefaultFileProvider,
+            "VersionContainer": VersionContainer,
+            "EGame": EGame,
+            "SearchOption": SearchOption,
+        }
+        return cls._types
 
 
 class TextureDecoder:
     """
-    Cooked `Texture2D` -> editable `.dds`, through the CUE4Parse-based decoder.
+    Cooked `Texture2D` -> editable `.dds`, through CUE4Parse in-process.
 
-    The decoder writes, per texture, a `.dds` holding the raw BC mip chain and a
-    `<name>.dds.json` sidecar describing pixel format and mip layout. The sidecar
-    plus the retained cooked asset are what a later write-back pass splices against;
-    exporting a flat .png here would make the edit irreversible.
+    One provider is mounted per container and reused for every asset in it, so the
+    mount cost is paid once. Each texture is written as a `.dds` holding the raw BC
+    mip chain plus a `<name>.dds.json` sidecar recording pixel format and mip layout.
+    Mip bytes are copied, never re-encoded, so a later write-back pass can splice
+    edited mips into the retained cooked asset.
+
+    CUE4Parse is read-only; nothing here writes back into the container.
     """
 
     def __init__(self, mount: Path) -> None:
-        #: Root of the unpacked cooked tree, needed as the decoder's mount point.
+        #: Root of the unpacked cooked tree, used as the provider's mount point.
         self.mount = mount
+        self._provider = None
+
+    @property
+    def provider(self):
+        """Mounted CUE4Parse provider over the cooked tree, created on first use."""
+        if self._provider is None:
+            t = CUE4Parse.types()
+            versions = t["VersionContainer"](getattr(t["EGame"], UE_VERSION))
+            provider = t["DefaultFileProvider"](
+                str(self.mount), t["SearchOption"].AllDirectories, versions
+            )
+            provider.Initialize()
+            if AES_KEY:
+                provider.SubmitKey(AES_KEY)
+            provider.Mount()
+            self._provider = provider
+        return self._provider
 
     def decode(self, asset: Path, dest: Path) -> list[Path]:
-        """Decode one cooked asset into `dest`; returns the images produced, ordered."""
+        """Decode every texture export in one cooked package; returns the .dds written."""
+        # The provider addresses packages by mount-relative path without extension.
+        pkg_path = asset.relative_to(self.mount).with_suffix("").as_posix()
+        package = self.provider.LoadPackage(pkg_path)
+
         dest.mkdir(parents=True, exist_ok=True)
-        argv = [
-            DECODER_PATH,
-            "--mount",
-            str(self.mount),
-            "--package",
-            asset.relative_to(self.mount).as_posix(),
-            "--game",
-            UE_VERSION,
-            "--out",
-            str(dest),
-        ]
-        if AES_KEY:
-            argv += ["--aes-key", AES_KEY]
-        run_tool(argv)
-        # A package may hold several textures, so every image produced is reported.
-        return images_under(dest)
+        written: list[Path] = []
+        for export in package.GetExports():
+            mips = self._mips_of(export)
+            if mips is None:
+                continue
+            written.append(self._write_texture(export, mips, dest, pkg_path))
+        return sorted(written)
+
+    # -- extraction from the object model -------------------------------------
+
+    @staticmethod
+    def _mips_of(export):
+        """
+        Mip list of an export, or None when it carries none.
+
+        Every export holding mips is treated as a texture; no class check is made,
+        since the walk only cares about the payload, not the UObject type.
+        """
+        mips = getattr(getattr(export, "PlatformData", None), "Mips", None)
+        return mips if mips else None
+
+    def _write_texture(self, export, mips, dest: Path, pkg_path: str) -> Path:
+        """Write one export as `<name>.dds` plus its sidecar; returns the .dds path."""
+        pixel_format = str(export.PlatformData.PixelFormat)
+        if pixel_format not in PIXEL_FORMATS:
+            raise RuntimeError(f"unsupported pixel format {pixel_format} in {pkg_path}")
+
+        # Marshal each mip out of .NET once; bytes(...) copies the managed array.
+        payloads = [bytes(mip.BulkData.Data) for mip in mips]
+        top = mips[0]
+        dds_path = dest / f"{export.Name}.dds"
+        dds_path.write_bytes(dds_bytes(pixel_format, top.SizeX, top.SizeY, payloads))
+
+        # Sidecar: everything the write-back pass needs to place edited mips back into
+        # the cooked payload. `offset` is into the .dds, so a resized edit can be
+        # located even when its length no longer matches the original.
+        offset = DDS_HEADER_SIZE + 4 + 20
+        records = []
+        for mip, payload in zip(mips, payloads):
+            records.append({
+                "width": mip.SizeX,
+                "height": mip.SizeY,
+                "size": len(payload),
+                "dds_offset": offset,
+            })
+            offset += len(payload)
+
+        sidecar = {
+            "package": pkg_path,
+            "export": str(export.Name),
+            "pixel_format": pixel_format,
+            "dxgi_format": PIXEL_FORMATS[pixel_format][0],
+            "mips": records,
+        }
+        dds_path.with_suffix(".dds.json").write_text(json.dumps(sidecar, indent=2))
+        return dds_path
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +572,7 @@ class ModWalker:
 
     def _walk_assets(self, cooked: Path, prefix: str) -> Iterator[WalkItem]:
         """Decode every cooked package below `cooked`, one at a time."""
-        decoder = TextureDecoder(cooked)
+        decoder = TextureDecoder(cooked)  # mounts once, reused for every asset below
         for asset in sorted(cooked.rglob("*.uasset")):
             asset_rel = join_rel(
                 prefix, archive_segment(asset.relative_to(cooked).as_posix())
