@@ -116,24 +116,52 @@ def work_dir(parent: Path) -> Iterator[Path]:
         shutil.rmtree(path, ignore_errors=True)
 
 
+class ToolError(RuntimeError):
+    """
+    An internal tool is missing or cannot be loaded.
+
+    Distinct from the per-file failures the walk skips: nothing downstream can
+    succeed once this is raised, so `ModWalker._guard` lets it through.
+    """
+
+
+def tool_path(configured: str) -> str | None:
+    """Resolve a configured binary against PATH, or None if it is not there."""
+    return shutil.which(configured) or (configured if Path(configured).is_file() else None)
+
+
+def require_tool(configured: str, what: str) -> str:
+    """Resolved path to one binary, or a fatal `ToolError` naming it."""
+    found = tool_path(configured)
+    if found is None:
+        log.error("%s not found: %r (see UEWalkerConfig)", what, configured)
+        raise ToolError(f"{what} not found: {configured!r}")
+    return found
+
+
 def require_tools() -> None:
     """Fail early, and by name, if a configured dependency is missing."""
-    if shutil.which(RETOC_PATH) is None and not Path(RETOC_PATH).is_file():
-        raise FileNotFoundError(
-            f"container unpacker not found: {RETOC_PATH!r} (see the globals at the top)"
-        )
+    require_tool(RETOC_PATH, "container unpacker (retoc)")
     if not Path(CUE4PARSE_DLL).is_file():
-        raise FileNotFoundError(
-            f"CUE4Parse.dll not found: {CUE4PARSE_DLL!r} (see the globals at the top)"
-        )
-    # REPAK_PATH is deliberately not checked: it is only reached by a .pak-only set,
-    # and pure-IoStore mods never need it.
+        log.error("CUE4Parse.dll not found: %r (see UEWalkerConfig)", CUE4PARSE_DLL)
+        raise ToolError(f"CUE4Parse.dll not found: {CUE4PARSE_DLL!r}")
+    # REPAK_PATH is deliberately not checked here: it is only reached by a .pak-only
+    # set, and pure-IoStore mods never need it. It is still fatal when reached.
 
 
 def run_tool(argv: list[str]) -> None:
-    """Run an external tool, raising with its own diagnostics attached on failure."""
+    """
+    Run an external tool.
+
+    A tool that cannot be launched at all is a `ToolError` and aborts the walk; a
+    tool that ran and rejected its input is an ordinary failure of that one file.
+    """
     log.debug("running: %s", " ".join(argv))
-    proc = subprocess.run(argv, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        log.error("cannot run %s: %s", argv[0], exc)
+        raise ToolError(f"cannot run {argv[0]}: {exc}") from exc
     if proc.stdout and proc.stdout.strip():
         log.debug("%s stdout: %s", argv[0], proc.stdout.strip())
     if proc.stderr and proc.stderr.strip():
@@ -173,16 +201,6 @@ def dds_bytes(pixel_format: str, width: int, height: int, mips: list[bytes]) -> 
     # DDS_HEADER_DXT10: format, D3D10_RESOURCE_DIMENSION_TEXTURE2D, flags, 1 slice, flags2
     header += struct.pack("<IIIII", dxgi, 3, 0, 1, 0)
     return header + b"".join(mips)
-
-
-def images_under(root: Path) -> list[Path]:
-    """All image files below `root`, ordered; previously written backups excluded."""
-
-    return sorted(
-        p
-        for p in root.rglob("*")
-        if p.is_file() and is_image(p.name) and not p.name.startswith(BACKUP_PREFIX)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +331,8 @@ class UEContainerSource(ArchiveSource):
         pak = next(self.set_dir.rglob("*.pak"), None)
         if pak is None:
             raise RuntimeError(f"no .pak/.utoc found in {self.set_dir}")
-        run_tool([REPAK_PATH, "unpack", "-o", str(dest), str(pak)])
+        repak = require_tool(REPAK_PATH, "legacy .pak unpacker (repak)")
+        run_tool([repak, "unpack", "-o", str(dest), str(pak)])
 
     @staticmethod
     def _from_iostore(utoc: Path, dest: Path) -> None:
@@ -360,21 +379,27 @@ class CUE4Parse:
         if cls._types is not None:
             return cls._types
 
-        from pythonnet import load
+        # Booting the CLR, binding the assembly and resolving its types either all
+        # work or the decoder is unusable for every asset: report once, fatally.
+        try:
+            from pythonnet import load
 
-        load("coreclr")  # must precede `import clr`
-        import clr
+            load("coreclr")  # must precede `import clr`
+            import clr
 
-        clr.AddReference(str(Path(CUE4PARSE_DLL).resolve()))
+            clr.AddReference(str(Path(CUE4PARSE_DLL).resolve()))
 
-        from CUE4Parse.Compression import OodleHelper  # noqa: PLC0415
-        from CUE4Parse.FileProvider import DefaultFileProvider  # noqa: PLC0415
-        from CUE4Parse.UE4.Versions import EGame, VersionContainer  # noqa: PLC0415
-        from System.IO import SearchOption  # noqa: PLC0415
+            from CUE4Parse.Compression import OodleHelper  # noqa: PLC0415
+            from CUE4Parse.FileProvider import DefaultFileProvider  # noqa: PLC0415
+            from CUE4Parse.UE4.Versions import EGame, VersionContainer  # noqa: PLC0415
+            from System.IO import SearchOption  # noqa: PLC0415
 
-        # UE 4.26 container data is Oodle-compressed. With no path given, CUE4Parse
-        # downloads an open-source Oodle build once and caches it next to the DLL.
-        OodleHelper.Initialize(OODLE_LIB)
+            # UE 4.26 container data is Oodle-compressed. With no path given, CUE4Parse
+            # downloads an open-source Oodle build once and caches it next to the DLL.
+            OodleHelper.Initialize(OODLE_LIB)
+        except Exception as exc:
+            log.error("cannot load CUE4Parse from %r: %s", CUE4PARSE_DLL, exc)
+            raise ToolError(f"cannot load CUE4Parse: {exc}") from exc
 
         cls._types = {
             "DefaultFileProvider": DefaultFileProvider,
@@ -510,9 +535,10 @@ class ModWalker:
     With `backup` on, an untouched `backup-<name>` copy of every yielded file is kept
     in the matching `out_dir` directory before the consumer sees it.
 
-    Lifetime: temp holds only intermediates (a .7z member, a container triplet) and is
-    dropped as the walk moves on; in selective mode at most one member is extracted per
-    call. Everything durable goes to `out_dir` under the yielded relative path: decoded
+    Lifetime: temp holds only intermediates (a container triplet), and each is deleted
+    as soon as retoc has read it, before any decoding starts, so one container's raw
+    payload is the peak. Extraction is batched per group (`selective` trades that back
+    for one member at a time). Nothing is extracted or delivered twice in one walk. Everything durable goes to `out_dir` under the yielded relative path: decoded
     textures, their sidecars, and the cooked assets they came from, which a later
     write-back pass needs. Loose images already on disk are yielded in place and never
     copied, so consumers edit the real mod file.
@@ -524,13 +550,19 @@ class ModWalker:
         self,
         mod_root: str | Path = MOD_ROOT,
         out_dir: str | Path = OUT_DIR,
-        selective: bool = True,
+        selective: bool = False,
         backup: bool = BACKUP,
     ) -> None:
         self.root = Path(mod_root).resolve()
         self.out = Path(out_dir).resolve()
+        #: One extract call per member instead of one per group. Bounds peak disk on a
+        #: huge archive, at the cost of re-decoding a solid archive once per member.
         self.selective = selective
         self.backup = backup
+        #: Relative paths already handed to the consumer, and container sets already
+        #: unpacked, so nothing is extracted or delivered twice in one walk.
+        self._seen: set[str] = set()
+        self._done_containers: set[str] = set()
 
     # -- public API ---------------------------------------------------------
 
@@ -559,6 +591,14 @@ class ModWalker:
     # -- layer 2: a .7z archive ----------------------------------------------
 
     def _walk_7z(self, archive: Path, prefix: str) -> Iterator[WalkItem]:
+        """
+        Walk one `.7z`: its loose images first, then each container set in turn.
+
+        py7zr reopens the archive per `extract` call, and a solid archive re-decodes
+        every block preceding the members asked for. Calls are therefore batched: one
+        for all images, one per container set. Never one per member, unless
+        `selective` is set for a caller that would rather trade time for peak disk.
+        """
         log.info("archive %s", prefix)
         source = SevenZipSource(archive)
         members = source.list_members()
@@ -578,21 +618,34 @@ class ModWalker:
         self, source: ArchiveSource, group: UEContainerSet, prefix: str
     ) -> Iterator[WalkItem]:
         """Materialise one container set out of the .7z, then descend into it."""
-        # The triplet itself is temp-only: `retoc to-zen` rebuilds it from the cooked
-        # tree on the way back, so persisting it would just duplicate the mod.
-        with work_dir(self.tmp_root) as set_dir:
+        set_prefix = join_rel(prefix, group.segment)
+        if not self._claim(self._done_containers, set_prefix, "container"):
+            return
+
+        # The triplet is temp-only: `retoc to-zen` rebuilds it from the cooked tree on
+        # the way back, so persisting it would just duplicate the mod. It is also dead
+        # the instant retoc has read it, so it is dropped before any decoding starts --
+        # only one container's worth of raw payload is ever on disk at a time.
+        set_dir = Path(tempfile.mkdtemp(dir=self.tmp_root))
+        try:
             source.extract(group.internal_names(), set_dir)
-            yield from self._walk_ue(set_dir, join_rel(prefix, group.segment))
+            cooked = self._unpack_ue(set_dir, set_prefix)
+        finally:
+            shutil.rmtree(set_dir, ignore_errors=True)
+        yield from self._walk_assets(cooked, set_prefix)
 
     # -- layer 3: a UE container set -----------------------------------------
 
-    def _walk_ue(self, set_dir: Path, prefix: str) -> Iterator[WalkItem]:
-        """Unpack the container straight into its output bundle, then decode each asset."""
-
+    def _unpack_ue(self, set_dir: Path, prefix: str) -> Path:
+        """Unpack the container straight into its output bundle; returns the cooked root."""
         log.info("container %s", prefix)
         cooked = self.out / prefix / COOKED_DIR
         UEContainerSource(set_dir).extract([], cooked)
-        yield from self._walk_assets(cooked, prefix)
+        return cooked
+
+    def _walk_ue(self, set_dir: Path, prefix: str) -> Iterator[WalkItem]:
+        """Unpack a container set already on disk, then decode each asset in it."""
+        yield from self._walk_assets(self._unpack_ue(set_dir, prefix), prefix)
 
     # -- layer 4: cooked assets ----------------------------------------------
 
@@ -647,6 +700,17 @@ class ModWalker:
             for internal in members:
                 yield from self._deliver(dest / internal, join_rel(prefix, internal))
 
+    # -- work already done ----------------------------------------------------
+
+    @staticmethod
+    def _claim(seen: set[str], key: str, what: str) -> bool:
+        """True the first time `key` is claimed; logs and returns False on a repeat."""
+        if key in seen:
+            log.debug("skipping repeated %s %s", what, key)
+            return False
+        seen.add(key)
+        return True
+
     def _deliver(self, path: Path | str, rel: str) -> Iterator[WalkItem]:
         """
         Back the file up if asked, then hand it to the consumer.
@@ -655,6 +719,8 @@ class ModWalker:
         anything already in the output tree, and lands in the matching output
         directory for a loose image yielded in place from the mod folder.
         """
+        if not self._claim(self._seen, rel, "file"):
+            return
         if self.backup:
             rel_path = PurePosixPath(rel)
             backup = self.out / rel_path.parent / f"{BACKUP_PREFIX}{rel_path.name}"
@@ -671,6 +737,8 @@ class ModWalker:
         """Log and swallow failures from one archive/member so the walk continues."""
         try:
             yield
+        except ToolError:
+            raise  # a broken tool breaks every remaining file: abort, do not skip
         except Exception as exc:  # noqa: BLE001 - a bad archive must not abort the walk
             log.warning("skipping %s: %s: %s", what, type(exc).__name__, exc)
             log.debug("traceback for %s", what, exc_info=True)
@@ -678,7 +746,7 @@ class ModWalker:
 
 def fileIterator(backup: bool = BACKUP) -> Iterator[WalkItem]:
     """Convenience wrapper over `ModWalker`; see it for semantics."""
-    return iter(ModWalker(MOD_ROOT, OUT_DIR, True, backup))
+    return iter(ModWalker(MOD_ROOT, OUT_DIR, False, backup))
 
 
 if __name__ == "__main__":
