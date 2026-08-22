@@ -1,8 +1,10 @@
 """
-Walk an Unreal Engine mod folder and yield every image inside it.
+Walk an Unreal Engine mod folder and yield every editable texture inside it.
 
-Descends recursively: mod root -> .7z archives -> UE containers (.pak / .utoc+.ucas).
-See `ModWalker` / `file_iterator` for the public entry points.
+Descends recursively: mod root -> .7z archives -> UE containers (.pak / .utoc+.ucas)
+-> cooked Zen assets -> decoded .dds. Decoded textures and everything a later
+write-back pass needs are written under `OUT_DIR`, keyed by the same relative path
+that is yielded. See `ModWalker` / `fileIterator` for the public entry points.
 """
 
 from __future__ import annotations
@@ -19,7 +21,32 @@ from pathlib import Path, PurePosixPath
 
 import py7zr
 
-log = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+#: Mod folder to walk. Overridden by argv[1] when run as a script.
+MOD_ROOT = "/path/to/mod"
+
+#: Durable output tree. Decoded textures, their sidecars and the cooked assets they
+#: came from are stored here under the yielded relative path.
+OUT_DIR = "/path/to/output"
+
+#: IoStore container unpacker. Prebuilt Linux binaries:
+#: https://github.com/trumank/retoc/releases
+RETOC_PATH = "retoc"
+
+#: CUE4Parse-based texture decoder. Dumps raw mips as .dds plus a .dds.json sidecar
+#: describing pixel format and mip layout, which is what makes the edit reversible.
+#: No prebuilt CLI exists; build a small .NET console app against the library:
+#: https://github.com/FabianFG/CUE4Parse (FModel, its GUI: https://fmodel.app)
+DECODER_PATH = "cue4parse-cli"
+
+#: AES key for encrypted containers. Mod-authored containers are normally plain.
+AES_KEY: str | None = None
+
+#: Engine version passed to the decoder; cooked assets are not self-describing.
+UE_VERSION = "GAME_UE4_26"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -29,16 +56,21 @@ IMAGE_EXTS = {".png", ".dds", ".tga", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff", 
 SEVENZIP_EXTS = {".7z"}
 UE_EXTS = {".pak", ".ucas", ".utoc"}
 
+#: Subdirectory of a container's output bundle holding the unpacked cooked assets.
+COOKED_DIR = "_cooked"
+
 # Which container member represents the set in the output path, most specific first.
 UE_REPRESENTATIVE_ORDER = (".ucas", ".pak", ".utoc")
 
-# (temp file absolute path, path relative to the mod root)
+# (absolute file path, path relative to the mod root)
 WalkItem = tuple[str, str]
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+log = logging.getLogger(__name__)
 
 def ext_of(name: str) -> str:
     """Lowercase suffix of a path-like name, `.dds` style (empty string if none)."""
@@ -81,9 +113,26 @@ def work_dir(parent: Path) -> Iterator[Path]:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def sole_file(root: Path) -> Path:
-    """The single file produced under `root` by a one-member extraction."""
-    return next(p for p in root.rglob("*") if p.is_file())
+def require_tools() -> None:
+    """Fail early, and by name, if a configured external tool is not on PATH."""
+    for label, tool in (
+        ("container unpacker", RETOC_PATH),
+        ("texture decoder", DECODER_PATH),
+    ):
+        if shutil.which(tool) is None and not Path(tool).is_file():
+            raise FileNotFoundError(
+                f"{label} not found: {tool!r} (see the globals at the top)"
+            )
+
+
+def run_tool(argv: list[str]) -> None:
+    """Run an external tool, raising with its own diagnostics attached on failure."""
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise RuntimeError(
+            f"{argv[0]} failed ({proc.returncode}): {detail[-1] if detail else 'no output'}"
+        )
 
 
 def images_under(root: Path) -> list[Path]:
@@ -185,10 +234,11 @@ class SevenZipSource(ArchiveSource):
 
 class UEContainerSource(ArchiveSource):
     """
-    A UE container set already materialised on disk, unpacked via retoc/repak.
+    A UE container set already materialised on disk, unpacked via retoc.
 
-    Always batch: the tools unpack a whole container, so single-asset extraction
-    is not available.
+    Always batch: retoc unpacks a whole container, so single-asset extraction is
+    not available at this layer. Output is cooked Zen assets (.uasset/.uexp/.ubulk),
+    not images; `TextureDecoder` handles the step after this one.
     """
 
     supports_selective = False
@@ -202,33 +252,54 @@ class UEContainerSource(ArchiveSource):
 
     def extract(self, members: list[str], dest: Path) -> None:
         """`members` is ignored: the whole container is unpacked into `dest`."""
-        utoc = next(self.set_dir.rglob("*.utoc"), None)
-        pak = next(self.set_dir.rglob("*.pak"), None)
-        if utoc is not None:
-            converted = dest / "converted.pak"
-            self._utoc_to_pak(utoc, converted)
-            self._unpack_pak(converted, dest)
-            converted.unlink(missing_ok=True)
-        elif pak is not None:
-            self._unpack_pak(pak, dest)
-        else:
+        # retoc reads the .ucas alongside its .utoc, so only the index file is named.
+        # A legacy .pak without an .utoc is passed directly.
+        entry = next(self.set_dir.rglob("*.utoc"), None) or next(
+            self.set_dir.rglob("*.pak"), None
+        )
+        if entry is None:
             raise RuntimeError(f"no .pak/.utoc found in {self.set_dir}")
 
-    # -- tool seams ---------------------------------------------------------
-    # TODO: pick and verify the actual UE unpacking tools. The retoc/repak calls below
-    # are placeholder shapes: subcommands, flag names and the IoStore -> legacy .pak
-    # step are all unconfirmed. Candidates to evaluate: retoc, repak, ZenTools,
-    # FModel/CUE4Parse. Nothing downstream of here works until this is settled.
+        dest.mkdir(parents=True, exist_ok=True)
+        argv = [RETOC_PATH, "unpack", str(entry), str(dest)]
+        if AES_KEY:
+            argv += ["--aes-key", AES_KEY]
+        run_tool(argv)
 
-    @staticmethod
-    def _utoc_to_pak(utoc: Path, out_pak: Path) -> None:
-        """Convert an IoStore set (.utoc + sibling .ucas) to a legacy .pak. UNVERIFIED."""
-        subprocess.run(["retoc", "to-legacy", str(utoc), str(out_pak)], check=True)
 
-    @staticmethod
-    def _unpack_pak(pak: Path, out_dir: Path) -> None:
-        """Unpack a legacy .pak into `out_dir`. UNVERIFIED."""
-        subprocess.run(["repak", "unpack", str(pak), "-o", str(out_dir)], check=True)
+class TextureDecoder:
+    """
+    Cooked `Texture2D` -> editable `.dds`, through the CUE4Parse-based decoder.
+
+    The decoder writes, per texture, a `.dds` holding the raw BC mip chain and a
+    `<name>.dds.json` sidecar describing pixel format and mip layout. The sidecar
+    plus the retained cooked asset are what a later write-back pass splices against;
+    exporting a flat .png here would make the edit irreversible.
+    """
+
+    def __init__(self, mount: Path) -> None:
+        #: Root of the unpacked cooked tree, needed as the decoder's mount point.
+        self.mount = mount
+
+    def decode(self, asset: Path, dest: Path) -> list[Path]:
+        """Decode one cooked asset into `dest`; returns the images produced, ordered."""
+        dest.mkdir(parents=True, exist_ok=True)
+        argv = [
+            DECODER_PATH,
+            "--mount",
+            str(self.mount),
+            "--package",
+            asset.relative_to(self.mount).as_posix(),
+            "--game",
+            UE_VERSION,
+            "--out",
+            str(dest),
+        ]
+        if AES_KEY:
+            argv += ["--aes-key", AES_KEY]
+        run_tool(argv)
+        # A package may hold several textures, so every image produced is reported.
+        return images_under(dest)
 
 
 # ---------------------------------------------------------------------------
@@ -237,27 +308,37 @@ class UEContainerSource(ArchiveSource):
 
 class ModWalker:
     """
-    Recursive image walker over a mod folder.
+    Recursive texture walker over a mod folder.
 
-    Yields `(absolute temp path, path relative to the mod root)`. Every archive adds a
-    `<name><ext>-extracted` segment, so a nested texture reads as
-    `abc.7z-extracted/def.ucas-extracted/texture.dds`.
+    Yields `(absolute path, path relative to the mod root)`. Every archive adds a
+    `<name><ext>-extracted` segment, and a cooked asset adds one too, so a nested
+    texture reads as `abc.7z-extracted/def.utoc-extracted/Game/Foo.uasset-extracted/Foo.dds`.
 
-    Lifetime: in selective mode at most one extracted image exists at a time, dropped
-    before the next is produced. Where selective extraction is unsupported (UE
-    containers) or disabled, a whole batch is extracted and kept until that batch is
-    exhausted. Loose images already on disk are yielded in place and never removed.
+    Lifetime: temp holds only intermediates (a .7z member, a container triplet) and is
+    dropped as the walk moves on; in selective mode at most one member is extracted per
+    call. Everything durable goes to `out_dir` under the yielded relative path: decoded
+    textures, their sidecars, and the cooked assets they came from, which a later
+    write-back pass needs. Loose images already on disk are yielded in place and never
+    copied, so consumers edit the real mod file.
 
-    Errors from a single archive or container are logged and skipped; the walk continues.
+    Errors from a single archive, container or asset are logged and skipped.
     """
 
-    def __init__(self, mod_root: str | Path, selective: bool = True) -> None:
+    def __init__(
+        self,
+        mod_root: str | Path = MOD_ROOT,
+        out_dir: str | Path = OUT_DIR,
+        selective: bool = True,
+    ) -> None:
         self.root = Path(mod_root).resolve()
+        self.out = Path(out_dir).resolve()
         self.selective = selective
 
     # -- public API ---------------------------------------------------------
 
     def __iter__(self) -> Iterator[WalkItem]:
+        require_tools()
+        self.out.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="modextract_") as tmp:
             self.tmp_root = Path(tmp)
             yield from self._walk_disk()
@@ -293,6 +374,8 @@ class ModWalker:
         self, source: ArchiveSource, group: UEContainerSet, prefix: str
     ) -> Iterator[WalkItem]:
         """Materialise one container set out of the .7z, then descend into it."""
+        # The triplet itself is temp-only: `retoc to-zen` rebuilds it from the cooked
+        # tree on the way back, so persisting it would just duplicate the mod.
         with work_dir(self.tmp_root) as set_dir:
             source.extract(group.internal_names(), set_dir)
             yield from self._walk_ue(set_dir, join_rel(prefix, group.segment))
@@ -300,59 +383,60 @@ class ModWalker:
     # -- layer 3: a UE container set -----------------------------------------
 
     def _walk_ue(self, set_dir: Path, prefix: str) -> Iterator[WalkItem]:
-        container = UEContainerSource(set_dir)
-        with work_dir(self.tmp_root) as out_dir:
-            container.extract([], out_dir)
-            for image in images_under(out_dir):
-                rel = join_rel(prefix, image.relative_to(out_dir).as_posix())
-                yield from self._yield_and_drop(image, rel)
+        """Unpack the container straight into its output bundle, then decode each asset."""
+
+        cooked = self.out / prefix / COOKED_DIR
+        UEContainerSource(set_dir).extract([], cooked)
+        yield from self._walk_assets(cooked, prefix)
+
+    # -- layer 4: cooked assets ----------------------------------------------
+
+    def _walk_assets(self, cooked: Path, prefix: str) -> Iterator[WalkItem]:
+        """Decode every cooked package below `cooked`, one at a time."""
+        decoder = TextureDecoder(cooked)
+        for asset in sorted(cooked.rglob("*.uasset")):
+            asset_rel = join_rel(
+                prefix, archive_segment(asset.relative_to(cooked).as_posix())
+            )
+            with self._guard(asset_rel):
+                # Sidecars land beside the .dds; both stay for the write-back pass.
+                for image in decoder.decode(asset, self.out / asset_rel):
+                    yield str(image), join_rel(asset_rel, image.name)
 
     # -- emission -------------------------------------------------------------
 
     def _emit(
         self, source: ArchiveSource, members: list[str], prefix: str
     ) -> Iterator[WalkItem]:
-        """Extract and yield `members`, selectively or in one batch."""
+        """Extract and yield `members` into the output tree, selectively or in one batch."""
+
         if not members:
             return
+        dest = self.out / prefix
         if self.selective and source.supports_selective:
-            yield from self._emit_selective(source, members, prefix)
+            yield from self._emit_selective(source, members, dest, prefix)
         else:
-            yield from self._emit_batch(source, members, prefix)
+            yield from self._emit_batch(source, members, dest, prefix)
 
     def _emit_selective(
-        self, source: ArchiveSource, members: list[str], prefix: str
+        self, source: ArchiveSource, members: list[str], dest: Path, prefix: str
     ) -> Iterator[WalkItem]:
-        """One member per extraction: only a single temp file is ever live."""
+        """One member per extraction: cheapest on disk, costliest on a solid archive."""
+
         for internal in members:
-            with self._guard(join_rel(prefix, internal)), work_dir(self.tmp_root) as scratch:
-                source.extract([internal], scratch)
-                yield str(sole_file(scratch)), join_rel(prefix, internal)
+            with self._guard(join_rel(prefix, internal)):
+                source.extract([internal], dest)
+                yield str(dest / internal), join_rel(prefix, internal)
 
     def _emit_batch(
-        self, source: ArchiveSource, members: list[str], prefix: str
+        self, source: ArchiveSource, members: list[str], dest: Path, prefix: str
     ) -> Iterator[WalkItem]:
-        """
-        One extraction for the whole group; files stay on disk until the group ends.
+        """One extraction for the whole group; a solid archive is decoded only once."""
 
-        Cheaper on solid archives, at the cost of holding the batch in the temp dir.
-        """
-        with self._guard(prefix), work_dir(self.tmp_root) as batch:
-            source.extract(members, batch)
-            for image in images_under(batch):
-                yield str(image), join_rel(prefix, image.relative_to(batch).as_posix())
-
-    def _yield_and_drop(self, path: Path, rel: str) -> Iterator[WalkItem]:
-        """
-        Hand one file to the consumer, then unlink it as soon as the consumer resumes.
-
-        `finally` also covers an abandoned generator, so the file cannot outlive the
-        iteration step it belongs to.
-        """
-        try:
-            yield str(path), rel
-        finally:
-            path.unlink(missing_ok=True)
+        with self._guard(prefix):
+            source.extract(members, dest)
+            for internal in members:
+                yield str(dest / internal), join_rel(prefix, internal)
 
     # -- error handling -------------------------------------------------------
 
@@ -365,14 +449,14 @@ class ModWalker:
             log.warning("skipping %s: %s", what, exc)
 
 
-def fileIterator(mod_root: str, selective: bool = True) -> Iterator[WalkItem]:
+def fileIterator() -> Iterator[WalkItem]:
     """Convenience wrapper over `ModWalker`; see it for semantics."""
-    return iter(ModWalker(mod_root, selective=selective))
+    return iter(ModWalker(MOD_ROOT, OUT_DIR, True))
 
 
 if __name__ == "__main__":
     import sys
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    for abs_path, rel_path in fileIterator(sys.argv[1]):
+    for abs_path, rel_path in fileIterator():
         print(rel_path, "->", abs_path)
