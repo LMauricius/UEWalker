@@ -35,6 +35,8 @@ OODLE_LIB: str | None = None
 RETOC_VERSION = "UE4_26"
 UE_VERSION = "GAME_UE4_26"
 
+UEWALKER_DEBUG = True
+
 
 #: Keep an untouched copy of every yielded file as `backup-<name>` in `OUT_DIR`,
 #: so an edit can be compared against, or reverted to, the original.

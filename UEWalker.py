@@ -132,7 +132,12 @@ def require_tools() -> None:
 
 def run_tool(argv: list[str]) -> None:
     """Run an external tool, raising with its own diagnostics attached on failure."""
+    log.debug("running: %s", " ".join(argv))
     proc = subprocess.run(argv, capture_output=True, text=True)
+    if proc.stdout and proc.stdout.strip():
+        log.debug("%s stdout: %s", argv[0], proc.stdout.strip())
+    if proc.stderr and proc.stderr.strip():
+        log.debug("%s stderr: %s", argv[0], proc.stderr.strip())
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         raise RuntimeError(
@@ -263,11 +268,15 @@ class SevenZipSource(ArchiveSource):
             for i in infos
             if not getattr(i, "is_directory", False)
         ]
+        log.debug("%s: %d members", self.path, len(names))
         return sorted(names)
 
     def extract(self, members: list[str], dest: Path) -> None:
         # py7zr must reopen the archive per call; selective extraction of a solid
         # archive therefore re-decodes preceding blocks (see ModWalker.selective).
+        log.debug(
+            "extracting %d member(s) from %s -> %s", len(members), self.path, dest
+        )
         with py7zr.SevenZipFile(self.path, "r") as z:
             z.extract(path=dest, targets=members)
 
@@ -293,6 +302,7 @@ class UEContainerSource(ArchiveSource):
     def extract(self, members: list[str], dest: Path) -> None:
         """`members` is ignored: the whole container is converted/unpacked into `dest`."""
         dest.mkdir(parents=True, exist_ok=True)
+        log.debug("unpacking container set %s -> %s", self.set_dir, dest)
 
         # retoc reads the .ucas alongside its .utoc, so only the index file is named.
         utoc = next(self.set_dir.rglob("*.utoc"), None)
@@ -391,6 +401,7 @@ class TextureDecoder:
             if AES_KEY:
                 provider.SubmitKey(AES_KEY)
             provider.Mount()
+            log.debug("mounted CUE4Parse provider at %s", self.mount)
             self._provider = provider
         return self._provider
 
@@ -398,6 +409,7 @@ class TextureDecoder:
         """Decode every texture export in one cooked package; returns the .dds written."""
         # The provider addresses packages by mount-relative path without extension.
         pkg_path = asset.relative_to(self.mount).with_suffix("").as_posix()
+        log.debug("decoding package %s", pkg_path)
         package = self.provider.LoadPackage(pkg_path)
 
         dest.mkdir(parents=True, exist_ok=True)
@@ -407,6 +419,7 @@ class TextureDecoder:
             if mips is None:
                 continue
             written.append(self._write_texture(export, mips, dest, pkg_path))
+        log.debug("%s: %d texture(s) decoded", pkg_path, len(written))
         return sorted(written)
 
     # -- extraction from the object model -------------------------------------
@@ -432,6 +445,14 @@ class TextureDecoder:
         payloads = [bytes(mip.BulkData.Data) for mip in mips]
         top = mips[0]
         dds_path = dest / f"{export.Name}.dds"
+        log.debug(
+            "texture %s (%s %dx%d, %d mips)",
+            export.Name,
+            pixel_format,
+            top.SizeX,
+            top.SizeY,
+            len(mips),
+        )
         dds_path.write_bytes(dds_bytes(pixel_format, top.SizeX, top.SizeY, payloads))
 
         # Sidecar: everything the write-back pass needs to place edited mips back into
@@ -500,6 +521,7 @@ class ModWalker:
 
     def __iter__(self) -> Iterator[WalkItem]:
         require_tools()
+        log.info("walking mod root %s -> %s", self.root, self.out)
         self.out.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="modextract_") as tmp:
             self.tmp_root = Path(tmp)
@@ -512,6 +534,7 @@ class ModWalker:
             if not child.is_file():
                 continue
             rel = child.relative_to(self.root).as_posix()
+            log.debug("disk: %s", rel)
             if child.suffix.lower() in SEVENZIP_EXTS:
                 with self._guard(rel):
                     yield from self._walk_7z(child, archive_segment(rel))
@@ -521,11 +544,15 @@ class ModWalker:
     # -- layer 2: a .7z archive ----------------------------------------------
 
     def _walk_7z(self, archive: Path, prefix: str) -> Iterator[WalkItem]:
+        log.info("archive %s", prefix)
         source = SevenZipSource(archive)
         members = source.list_members()
         images = [m for m in members if is_image(m)]
         containers = group_ue_members(m for m in members if ext_of(m) in UE_EXTS)
 
+        log.debug(
+            "%s: %d image(s), %d container set(s)", prefix, len(images), len(containers)
+        )
         yield from self._emit(source, images, prefix)
 
         for group in containers:
@@ -547,6 +574,7 @@ class ModWalker:
     def _walk_ue(self, set_dir: Path, prefix: str) -> Iterator[WalkItem]:
         """Unpack the container straight into its output bundle, then decode each asset."""
 
+        log.info("container %s", prefix)
         cooked = self.out / prefix / COOKED_DIR
         UEContainerSource(set_dir).extract([], cooked)
         yield from self._walk_assets(cooked, prefix)
@@ -556,7 +584,9 @@ class ModWalker:
     def _walk_assets(self, cooked: Path, prefix: str) -> Iterator[WalkItem]:
         """Decode every cooked package below `cooked`, one at a time."""
         decoder = TextureDecoder(cooked)  # mounts once, reused for every asset below
-        for asset in sorted(cooked.rglob("*.uasset")):
+        assets = sorted(cooked.rglob("*.uasset"))
+        log.debug("%s: %d cooked asset(s)", prefix, len(assets))
+        for asset in assets:
             asset_rel = join_rel(
                 prefix, archive_segment(asset.relative_to(cooked).as_posix())
             )
@@ -587,6 +617,7 @@ class ModWalker:
 
         for internal in members:
             with self._guard(join_rel(prefix, internal)):
+                log.debug("member %s", join_rel(prefix, internal))
                 source.extract([internal], dest)
                 yield from self._deliver(dest / internal, join_rel(prefix, internal))
 
@@ -596,6 +627,7 @@ class ModWalker:
         """One extraction for the whole group; a solid archive is decoded only once."""
 
         with self._guard(prefix):
+            log.debug("batch extract of %d member(s) into %s", len(members), prefix)
             source.extract(members, dest)
             for internal in members:
                 yield from self._deliver(dest / internal, join_rel(prefix, internal))
@@ -612,7 +644,9 @@ class ModWalker:
             rel_path = PurePosixPath(rel)
             backup = self.out / rel_path.parent / f"{BACKUP_PREFIX}{rel_path.name}"
             backup.parent.mkdir(parents=True, exist_ok=True)
+            log.debug("backup %s", backup)
             shutil.copy2(path, backup)
+        log.info("yielding %s", rel)
         yield str(path), rel
 
     # -- error handling -------------------------------------------------------
@@ -623,7 +657,8 @@ class ModWalker:
         try:
             yield
         except Exception as exc:  # noqa: BLE001 - a bad archive must not abort the walk
-            log.warning("skipping %s: %s", what, exc)
+            log.warning("skipping %s: %s: %s", what, type(exc).__name__, exc)
+            log.debug("traceback for %s", what, exc_info=True)
 
 
 def fileIterator(backup: bool = BACKUP) -> Iterator[WalkItem]:
@@ -634,6 +669,9 @@ def fileIterator(backup: bool = BACKUP) -> Iterator[WalkItem]:
 if __name__ == "__main__":
     import sys
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if UEWALKER_DEBUG else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
     for abs_path, rel_path in fileIterator():
         print(rel_path, "->", abs_path)
