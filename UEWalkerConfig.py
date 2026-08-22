@@ -34,3 +34,8 @@ OODLE_LIB: str | None = None
 #: it differently: retoc takes `UE4_26`, CUE4Parse takes the `EGame` member name.
 RETOC_VERSION = "UE4_26"
 UE_VERSION = "GAME_UE4_26"
+
+
+#: Keep an untouched copy of every yielded file as `backup-<name>` in `OUT_DIR`,
+#: so an edit can be compared against, or reverted to, the original.
+BACKUP = False

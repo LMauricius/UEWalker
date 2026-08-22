@@ -29,18 +29,6 @@ import py7zr
 
 from UEWalkerConfig import *
 
-#: AES key for encrypted containers. Mod-authored containers are normally plain.
-AES_KEY: str | None = None
-
-#: Oodle library (`liboodle-data-shared.so`). None lets CUE4Parse fetch an
-#: open-source build itself on first use: https://github.com/WorkingRobot/OodleUE
-OODLE_LIB: str | None = None
-
-#: Engine version. Cooked assets are not self-describing, and the two tools spell
-#: it differently: retoc takes `UE4_26`, CUE4Parse takes the `EGame` member name.
-RETOC_VERSION = "UE4_26"
-UE_VERSION = "GAME_UE4_26"
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -51,6 +39,10 @@ UE_EXTS = {".pak", ".ucas", ".utoc"}
 
 #: Subdirectory of a container's output bundle holding the unpacked cooked assets.
 COOKED_DIR = "_cooked"
+
+#: Prefix marking an untouched copy. Also excluded from image scans, so a backup is
+#: never mistaken for a texture on a later pass over the same output directory.
+BACKUP_PREFIX = "backup-"
 
 # UE pixel format -> (DXGI format, bytes per 4x4 block, block-compressed?).
 # Only the formats game textures actually ship in; anything else is skipped loudly.
@@ -179,8 +171,13 @@ def dds_bytes(pixel_format: str, width: int, height: int, mips: list[bytes]) -> 
 
 
 def images_under(root: Path) -> list[Path]:
-    """All image files below `root`, ordered."""
-    return sorted(p for p in root.rglob("*") if p.is_file() and is_image(p.name))
+    """All image files below `root`, ordered; previously written backups excluded."""
+
+    return sorted(
+        p
+        for p in root.rglob("*")
+        if p.is_file() and is_image(p.name) and not p.name.startswith(BACKUP_PREFIX)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +471,9 @@ class ModWalker:
     `<name><ext>-extracted` segment, and a cooked asset adds one too, so a nested
     texture reads as `abc.7z-extracted/def.utoc-extracted/Game/Foo.uasset-extracted/Foo.dds`.
 
+    With `backup` on, an untouched `backup-<name>` copy of every yielded file is kept
+    in the matching `out_dir` directory before the consumer sees it.
+
     Lifetime: temp holds only intermediates (a .7z member, a container triplet) and is
     dropped as the walk moves on; in selective mode at most one member is extracted per
     call. Everything durable goes to `out_dir` under the yielded relative path: decoded
@@ -489,10 +489,12 @@ class ModWalker:
         mod_root: str | Path = MOD_ROOT,
         out_dir: str | Path = OUT_DIR,
         selective: bool = True,
+        backup: bool = BACKUP,
     ) -> None:
         self.root = Path(mod_root).resolve()
         self.out = Path(out_dir).resolve()
         self.selective = selective
+        self.backup = backup
 
     # -- public API ---------------------------------------------------------
 
@@ -514,7 +516,7 @@ class ModWalker:
                 with self._guard(rel):
                     yield from self._walk_7z(child, archive_segment(rel))
             elif is_image(child.name):
-                yield str(child), rel
+                yield from self._deliver(child, rel)
 
     # -- layer 2: a .7z archive ----------------------------------------------
 
@@ -561,7 +563,7 @@ class ModWalker:
             with self._guard(asset_rel):
                 # Sidecars land beside the .dds; both stay for the write-back pass.
                 for image in decoder.decode(asset, self.out / asset_rel):
-                    yield str(image), join_rel(asset_rel, image.name)
+                    yield from self._deliver(image, join_rel(asset_rel, image.name))
 
     # -- emission -------------------------------------------------------------
 
@@ -586,7 +588,7 @@ class ModWalker:
         for internal in members:
             with self._guard(join_rel(prefix, internal)):
                 source.extract([internal], dest)
-                yield str(dest / internal), join_rel(prefix, internal)
+                yield from self._deliver(dest / internal, join_rel(prefix, internal))
 
     def _emit_batch(
         self, source: ArchiveSource, members: list[str], dest: Path, prefix: str
@@ -596,7 +598,22 @@ class ModWalker:
         with self._guard(prefix):
             source.extract(members, dest)
             for internal in members:
-                yield str(dest / internal), join_rel(prefix, internal)
+                yield from self._deliver(dest / internal, join_rel(prefix, internal))
+
+    def _deliver(self, path: Path | str, rel: str) -> Iterator[WalkItem]:
+        """
+        Back the file up if asked, then hand it to the consumer.
+
+        The backup mirrors `rel` under `out`, so it sits beside the yielded file for
+        anything already in the output tree, and lands in the matching output
+        directory for a loose image yielded in place from the mod folder.
+        """
+        if self.backup:
+            rel_path = PurePosixPath(rel)
+            backup = self.out / rel_path.parent / f"{BACKUP_PREFIX}{rel_path.name}"
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, backup)
+        yield str(path), rel
 
     # -- error handling -------------------------------------------------------
 
@@ -609,9 +626,9 @@ class ModWalker:
             log.warning("skipping %s: %s", what, exc)
 
 
-def fileIterator() -> Iterator[WalkItem]:
+def fileIterator(backup: bool = BACKUP) -> Iterator[WalkItem]:
     """Convenience wrapper over `ModWalker`; see it for semantics."""
-    return iter(ModWalker(MOD_ROOT, OUT_DIR, True))
+    return iter(ModWalker(MOD_ROOT, OUT_DIR, True, backup))
 
 
 if __name__ == "__main__":

@@ -115,6 +115,7 @@ OUT_DIR       = "/path/to/output"
 RETOC_PATH    = "retoc"                                   # or an absolute path
 REPAK_PATH    = "repak"
 CUE4PARSE_DLL = "/home/you/src/CUE4Parse/CUE4Parse/bin/Release/net8.0/CUE4Parse.dll"
+BACKUP        = False                                     # True keeps a backup- copy of each file
 OODLE_LIB     = None                                      # None = let CUE4Parse fetch it
 AES_KEY       = None                                      # mod containers are normally plain
 RETOC_VERSION = "UE4_26"
