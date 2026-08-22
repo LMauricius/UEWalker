@@ -459,10 +459,15 @@ class TextureDecoder:
             self._provider = provider
         return self._provider
 
-    def decode(self, asset: Path, dest: Path) -> list[Path]:
+    def packages(self) -> list[str]:
+        """Every package in the mounted container, as provider keys, sorted."""
+        keys = [str(k) for k in self.provider.Files.Keys]
+        return sorted(k for k in keys if k.lower().endswith(".uasset"))
+
+    def decode(self, key: str, dest: Path) -> list[Path]:
         """Decode every texture export in one cooked package; returns the .dds written."""
-        # The provider addresses packages by mount-relative path without extension.
-        pkg_path = asset.relative_to(self.mount).with_suffix("").as_posix()
+        # Keys come from the provider's own index, so they always address a package.
+        pkg_path = key.rsplit(".", 1)[0]
         log.debug("decoding package %s", pkg_path)
         package = self.provider.LoadPackage(pkg_path)
 
@@ -666,12 +671,13 @@ class ModWalker:
     def _walk_assets(self, cooked: Path, prefix: str) -> Iterator[WalkItem]:
         """Decode every cooked package below `cooked`, one at a time."""
         decoder = TextureDecoder(cooked)  # mounts once, reused for every asset below
-        assets = sorted(cooked.rglob("*.uasset"))
+        # Assets are enumerated from the provider index, not from disk: the provider
+        # addresses packages by the container's own virtual paths, which need not
+        # match the unpacked tree's layout.
+        assets = decoder.packages()
         log.debug("%s: %d cooked asset(s)", prefix, len(assets))
         for asset in assets:
-            asset_rel = join_rel(
-                prefix, archive_segment(asset.relative_to(cooked).as_posix())
-            )
+            asset_rel = join_rel(prefix, archive_segment(asset))
             with self._guard(asset_rel):
                 # Sidecars land beside the .dds; both stay for the write-back pass.
                 for image in decoder.decode(asset, self.out / asset_rel):
