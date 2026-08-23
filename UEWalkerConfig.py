@@ -23,6 +23,22 @@ REPAK_PATH = "repak"
 #: directory. https://github.com/FabianFG/CUE4Parse (FModel, its GUI: https://fmodel.app)
 CUE4PARSE_DLL = "/path/to/CUE4Parse.dll"
 
+
+#: `CUE4Parse.runtimeconfig.json` from the same publish output. pythonnet needs it to
+#: pick the runtime version the assembly was built for; None lets it guess, which only
+#: works when exactly one matching runtime is installed.
+DOTNET_RUNTIME_CONFIG: str | None = (
+    "/home/mauricios/Programs/Mo/CUE4Parse/c4pfetch.runtimeconfig.json"
+)
+
+
+#: The game's `Content/Paks` folder, read only for `global.utoc`/`global.ucas`.
+#: An IoStore package keeps its script-object table in that global container rather
+#: than in the container shipping it, so a mod container cannot be decoded on its own.
+#: Only the two global files are ever mounted; the rest of the folder is untouched.
+#: None means IoStore mods will not decode, though legacy `.pak` ones still will.
+GAME_PAKS: str | None = "/path/to/game/End/Content/Paks"
+
 #: AES key for encrypted containers. Mod-authored containers are normally plain.
 AES_KEY: str | None = None
 

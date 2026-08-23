@@ -9,6 +9,7 @@ that is yielded. See `ModWalker` / `fileIterator` for the public entry points.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import shutil
@@ -76,6 +77,9 @@ WalkItem = tuple[str, str]
 
 log = logging.getLogger(__name__)
 
+#: Memo for `global_dir`, which resolves the game's global container once per process.
+_GLOBAL_DIR: dict[str, str | None] = {}
+
 def ext_of(name: str) -> str:
     """Lowercase suffix of a path-like name, `.dds` style (empty string if none)."""
     return PurePosixPath(name).suffix.lower()
@@ -89,6 +93,14 @@ def is_image(name: str) -> bool:
 def to_posix(internal: str) -> str:
     """Normalise an archive-internal member name to forward slashes."""
     return internal.replace("\\", "/")
+
+
+def drop(path: Path) -> None:
+    """Remove a file or directory tree, ignoring anything that is not there."""
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def join_rel(*parts: str) -> str:
@@ -105,6 +117,43 @@ def archive_segment(relpath: str) -> str:
     """
     p = PurePosixPath(relpath)
     return join_rel(str(p.parent), p.name + "-extracted")
+
+
+def global_dir() -> str | None:
+    """
+    Directory to mount beside a container so IoStore packages can be serialized.
+
+    An IoStore package resolves its script objects through the game's global
+    container, so a mod container alone cannot be read. Only `global.utoc` and
+    `global.ucas` are wanted, and `GAME_PAKS` also holds the game's full content
+    (well over a hundred gigabytes), which the provider would otherwise index in
+    its entirety: the two files are symlinked into a directory of their own and
+    that is mounted instead. Returns None when the global container is unavailable,
+    which costs IoStore mods but leaves legacy `.pak` ones working.
+    """
+    if _GLOBAL_DIR.get("path", ...) is not ...:  # resolved once per process
+        return _GLOBAL_DIR["path"]
+
+    _GLOBAL_DIR["path"] = None
+    if not GAME_PAKS:
+        log.warning("GAME_PAKS is unset: IoStore containers cannot be decoded")
+        return None
+
+    paks = Path(GAME_PAKS)
+    members = [paks / "global.utoc", paks / "global.ucas"]
+    if missing := [m.name for m in members if not m.is_file()]:
+        log.warning("%s: no %s: IoStore containers cannot be decoded", paks, ", ".join(missing))
+        return None
+
+    # Long-lived: every container mounts it, so it outlives any one walk rather than
+    # being tied to a walk's scratch tree, and is dropped when the process ends.
+    holder = Path(tempfile.mkdtemp(prefix="uewalker-global-"))
+    atexit.register(shutil.rmtree, holder, ignore_errors=True)
+    for member in members:
+        (holder / member.name).symlink_to(member)
+    log.debug("global container mounted from %s", paks)
+    _GLOBAL_DIR["path"] = str(holder)
+    return _GLOBAL_DIR["path"]
 
 
 @contextmanager
@@ -403,11 +452,21 @@ class CUE4Parse:
             from CUE4Parse.Compression import OodleHelper  # noqa: PLC0415
             from CUE4Parse.FileProvider import DefaultFileProvider  # noqa: PLC0415
             from CUE4Parse.UE4.Versions import EGame, VersionContainer  # noqa: PLC0415
-            from System.IO import SearchOption  # noqa: PLC0415
+            from System.IO import DirectoryInfo, SearchOption  # noqa: PLC0415
 
-            # UE 4.26 container data is Oodle-compressed. With no path given, CUE4Parse
-            # downloads an open-source Oodle build once and caches it next to the DLL.
-            OodleHelper.Initialize(OODLE_LIB)
+            # UE 4.26 container data is Oodle-compressed, and the native Oodle library
+            # is loaded separately from the assembly. `Initialize` downloads an
+            # open-source build to the path it is given when that path does not exist
+            # yet, so the cache lives next to the DLL unless OODLE_LIB overrides it.
+            #
+            # The path must never be None: `Initialize` is overloaded on (str) and
+            # (Oodle), and a None binds the second overload, which installs a null
+            # instance and returns cleanly. The failure would then only surface much
+            # later, as a NullReferenceException inside the decompressor.
+            oodle = OODLE_LIB or str(dll.parent / OodleHelper.OodleFileName)
+            OodleHelper.Initialize(oodle)
+            if OodleHelper.Instance is None:
+                raise RuntimeError(f"Oodle library unavailable at {oodle!r}")
         except Exception as exc:
             log.error("cannot load CUE4Parse from %r: %s", CUE4PARSE_DLL, exc)
             raise ToolError(
@@ -420,6 +479,8 @@ class CUE4Parse:
             "VersionContainer": VersionContainer,
             "EGame": EGame,
             "SearchOption": SearchOption,
+            "DirectoryInfo": DirectoryInfo,
+            "OodleHelper": OodleHelper,
         }
         return cls._types
 
@@ -428,8 +489,11 @@ class TextureDecoder:
     """
     Cooked `Texture2D` -> editable `.dds`, through CUE4Parse in-process.
 
-    One provider is mounted per container and reused for every asset in it, so the
-    mount cost is paid once. Each texture is written as a `.dds` holding the raw BC
+    The provider is mounted on the container directory (the `.utoc`/`.ucas`/`.pak`
+    set itself), not on retoc's unpacked tree: CUE4Parse reads IoStore/Zen natively,
+    while `retoc unpack` output has no legacy package header and cannot be parsed as
+    loose assets. One provider is mounted per container and reused for every asset in
+    it, so the mount cost is paid once. Each texture is written as a `.dds` holding the raw BC
     mip chain plus a `<name>.dds.json` sidecar recording pixel format and mip layout.
     Mip bytes are copied, never re-encoded, so a later write-back pass can splice
     edited mips into the retained cooked asset.
@@ -438,19 +502,35 @@ class TextureDecoder:
     """
 
     def __init__(self, mount: Path) -> None:
-        #: Root of the unpacked cooked tree, used as the provider's mount point.
+        #: Directory holding the container set, used as the provider's mount point.
         self.mount = mount
         self._provider = None
 
     @property
     def provider(self):
-        """Mounted CUE4Parse provider over the cooked tree, created on first use."""
+        """Mounted CUE4Parse provider over the container set, created on first use."""
         if self._provider is None:
             t = CUE4Parse.types()
             versions = t["VersionContainer"](getattr(t["EGame"], UE_VERSION))
-            provider = t["DefaultFileProvider"](
-                str(self.mount), t["SearchOption"].AllDirectories, versions
-            )
+
+            # The game's global container rides along as an extra mount so IoStore
+            # packages can resolve their script objects; without it every one of them
+            # fails to serialize. The overload taking extra directories is only
+            # selected when there is one, since it is absent for legacy `.pak` sets.
+            extra = global_dir()
+            directory = t["DirectoryInfo"](str(self.mount))
+            if extra:
+                provider = t["DefaultFileProvider"](
+                    directory,
+                    [t["DirectoryInfo"](extra)],
+                    t["SearchOption"].AllDirectories,
+                    True,
+                    versions,
+                )
+            else:
+                provider = t["DefaultFileProvider"](
+                    directory, t["SearchOption"].AllDirectories, True, versions
+                )
             provider.Initialize()
             if AES_KEY:
                 provider.SubmitKey(AES_KEY)
@@ -642,38 +722,62 @@ class ModWalker:
             return
 
         # The triplet is temp-only: `retoc to-zen` rebuilds it from the cooked tree on
-        # the way back, so persisting it would just duplicate the mod. It is also dead
-        # the instant retoc has read it, so it is dropped before any decoding starts --
-        # only one container's worth of raw payload is ever on disk at a time.
+        # the way back, so persisting it would just duplicate the mod. It has to outlive
+        # retoc, though: the decoder reads the container directly, so it is dropped only
+        # once this container's assets are done. Still one container's worth at a time.
         set_dir = Path(tempfile.mkdtemp(dir=self.tmp_root))
         try:
             source.extract(group.internal_names(), set_dir)
-            cooked = self._unpack_ue(set_dir, set_prefix)
+            yield from self._walk_ue(set_dir, set_prefix)
         finally:
             shutil.rmtree(set_dir, ignore_errors=True)
-        yield from self._walk_assets(cooked, set_prefix)
 
     # -- layer 3: a UE container set -----------------------------------------
 
     def _unpack_ue(self, set_dir: Path, prefix: str) -> Path:
-        """Unpack the container straight into its output bundle; returns the cooked root."""
+        """Unpack the container into its output bundle for write-back; returns the root."""
         log.info("container %s", prefix)
         cooked = self.out / prefix / COOKED_DIR
         UEContainerSource(set_dir).extract([], cooked)
         return cooked
 
     def _walk_ue(self, set_dir: Path, prefix: str) -> Iterator[WalkItem]:
-        """Unpack a container set already on disk, then decode each asset in it."""
-        yield from self._walk_assets(self._unpack_ue(set_dir, prefix), prefix)
+        """
+        Unpack a container set for write-back, then decode straight out of it.
+
+        retoc's cooked tree is the write-back target only; the textures come from the
+        container through CUE4Parse. Neither side blocks the other: an unusable cooked
+        tree is dropped and decoding goes on without it, and if nothing decodes the
+        tree is dead weight (nothing to splice back in), so the whole bundle goes.
+        """
+        # An unusable cooked tree does not stop the textures from being decoded; it
+        # only means there is nothing to splice them back into, so it is not kept.
+        cooked = None
+        with self._guard(join_rel(prefix, COOKED_DIR)):
+            cooked = self._unpack_ue(set_dir, prefix)
+        if cooked is not None and not any(cooked.rglob("*")):
+            cooked = None
+        if cooked is None:
+            log.warning("%s: no cooked tree, textures will not be write-backable", prefix)
+            drop(self.out / prefix / COOKED_DIR)
+
+        delivered = 0
+        try:
+            for item in self._walk_assets(set_dir, prefix):
+                delivered += 1
+                yield item
+        finally:
+            if not delivered:
+                log.info("%s: nothing decoded, dropping the output bundle", prefix)
+                shutil.rmtree(self.out / prefix, ignore_errors=True)
 
     # -- layer 4: cooked assets ----------------------------------------------
 
-    def _walk_assets(self, cooked: Path, prefix: str) -> Iterator[WalkItem]:
-        """Decode every cooked package below `cooked`, one at a time."""
-        decoder = TextureDecoder(cooked)  # mounts once, reused for every asset below
-        # Assets are enumerated from the provider index, not from disk: the provider
-        # addresses packages by the container's own virtual paths, which need not
-        # match the unpacked tree's layout.
+    def _walk_assets(self, mount: Path, prefix: str) -> Iterator[WalkItem]:
+        """Decode every package in the container at `mount`, one at a time."""
+        decoder = TextureDecoder(mount)  # mounts once, reused for every asset below
+        # Assets come from the provider's own index, which is the only authority on
+        # what the container holds and how its packages are addressed.
         assets = decoder.packages()
         log.debug("%s: %d cooked asset(s)", prefix, len(assets))
         for asset in assets:
@@ -708,17 +812,30 @@ class ModWalker:
                 log.debug("member %s", join_rel(prefix, internal))
                 source.extract([internal], dest)
                 yield from self._deliver(dest / internal, join_rel(prefix, internal))
+                continue
+            # The guard swallowed a failure: drop whatever half-landed on disk.
+            drop(dest / internal)
 
     def _emit_batch(
         self, source: ArchiveSource, members: list[str], dest: Path, prefix: str
     ) -> Iterator[WalkItem]:
         """One extraction for the whole group; a solid archive is decoded only once."""
 
-        with self._guard(prefix):
-            log.debug("batch extract of %d member(s) into %s", len(members), prefix)
-            source.extract(members, dest)
+        delivered: set[str] = set()
+        try:
+            with self._guard(prefix):
+                log.debug("batch extract of %d member(s) into %s", len(members), prefix)
+                source.extract(members, dest)
+                for internal in members:
+                    for item in self._deliver(dest / internal, join_rel(prefix, internal)):
+                        delivered.add(internal)
+                        yield item
+        finally:
+            # A failed or abandoned batch still leaves extracted files behind: only
+            # what actually reached the consumer is allowed to stay in the output.
             for internal in members:
-                yield from self._deliver(dest / internal, join_rel(prefix, internal))
+                if internal not in delivered:
+                    drop(dest / internal)
 
     # -- work already done ----------------------------------------------------
 

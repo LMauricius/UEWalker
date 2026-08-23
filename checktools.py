@@ -182,7 +182,10 @@ def check_cue4parse() -> str:
     t = W.CUE4Parse.types()
     game = getattr(t["EGame"], UE_VERSION)  # raises if UE_VERSION is misspelled
     t["VersionContainer"](game)             # raises if the ctor signature drifted
-    return f"CLR up, {UE_VERSION} resolved"
+    # Booting the loader already fails hard on a missing Oodle library; naming it here
+    # keeps a decode-blocking dependency visible in the report instead of implied.
+    oodle = t["OodleHelper"].OodleFileName
+    return f"CLR up, {UE_VERSION} resolved, {oodle} loaded"
 
 
 def check_dds_writer() -> str:

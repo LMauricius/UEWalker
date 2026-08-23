@@ -105,10 +105,14 @@ native Oodle library to read them. On Linux the file is called
 `liboodle-data-shared.so` (`oodle-data-shared.dll` on Windows; older builds went by
 `oo2core_9_win64.dll`).
 
-Usually there is nothing to do here. The script calls `OodleHelper.Initialize()` with
-no path, and CUE4Parse then downloads an open-source Oodle build from
-[OodleUE](https://github.com/WorkingRobot/OodleUE) on first use and caches it. That
-needs network access once.
+Usually there is nothing to do here. The script always hands `OodleHelper.Initialize()`
+a real path (by default beside `CUE4Parse.dll`), and CUE4Parse downloads an open-source
+Oodle build from [OodleUE](https://github.com/WorkingRobot/OodleUE) into it on first use,
+then reuses that copy. This needs network access once.
+
+The path matters: `Initialize` is overloaded on a string and on an `Oodle` instance, and
+a null selects the second, quietly installing an empty decompressor. Containers then read
+as corrupt much later on, so the script checks that a library really was loaded.
 
 For an offline machine, fetch `gcc-x64-release.zip` from the OodleUE releases page
 yourself, extract `liboodle-data-shared.so`, and point the global at it:
@@ -119,7 +123,21 @@ OODLE_LIB = "/path/to/liboodle-data-shared.so"
 
 The library shipped with the game or with an FF7R modding toolkit works equally well.
 
-## 6. repak (optional)
+## 6. The game's global container
+
+An IoStore package stores its script-object table in the game's `global.utoc`, not in
+the container that ships it, so a mod container cannot be decoded on its own. Point
+`GAME_PAKS` at the game's `Content/Paks` folder:
+
+```python
+GAME_PAKS = "/path/to/FINAL FANTASY VII REBIRTH/End/Content/Paks"
+```
+
+Only `global.utoc` and `global.ucas` are ever read (about 2 MB together); the rest of
+the folder is left alone and never indexed. Leaving this as `None` is allowed: legacy
+`.pak` mods still decode, while IoStore ones report `global data is missing` per asset.
+
+## 7. repak (optional)
 
 Only if a mod contains a `.pak` with no matching `.utoc`:
 
@@ -129,7 +147,7 @@ curl -sSL https://github.com/trumank/repak/releases/latest/download/repak_cli-x8
 install /tmp/repak_cli-x86_64-unknown-linux-gnu/repak ~/.local/bin/
 ```
 
-## 7. Point the script at everything
+## 8. Point the script at everything
 
 Edit `UEWalkerConfig.py`:
 
@@ -139,6 +157,7 @@ OUT_DIR       = "/path/to/output"
 RETOC_PATH    = "retoc"                                   # or an absolute path
 REPAK_PATH    = "repak"
 CUE4PARSE_DLL = "/home/you/Programs/CUE4Parse/CUE4Parse.dll"   # a publish output; `~` is not expanded
+GAME_PAKS     = "/path/to/game/End/Content/Paks"          # read only for global.utoc/.ucas
 BACKUP        = False                                     # True keeps a backup- copy of each file
 OODLE_LIB     = None                                      # None = let CUE4Parse fetch it
 AES_KEY       = None                                      # mod containers are normally plain
@@ -151,7 +170,7 @@ DOTNET_RUNTIME_CONFIG = "/home/you/Programs/CUE4Parse/cue4parse-fetch.runtimecon
 both 8.0 and 10.0 side by side is common): it tells `pythonnet` which version to boot
 instead of letting it guess. The file sits beside `CUE4Parse.dll` in the build output.
 
-## 8. Verify
+## 9. Verify
 
 ```bash
 python checktools.py                  # every dependency, in the order the walk hits them
@@ -171,6 +190,13 @@ misconfigured path fails immediately rather than halfway through a mod.
 ## Verification status
 
 `retoc` is confirmed against release v0.1.5: `to-legacy <utoc> <outdir>` and the global
-`-a/--aes-key` flag both match what the script calls. The CUE4Parse side (type names,
-`PlatformData.Mips`, `BulkData.Data`) is written from documentation and has not yet
-been run against a built assembly. Expect to adjust `TextureDecoder` on first contact.
+`-a/--aes-key` flag both match what the script calls.
+
+The CUE4Parse side is confirmed against a built assembly and a real mod, decoding 567
+textures to valid BC1 DX10 `.dds` files with matching sidecars.
+
+One rough edge remains on the retoc side. Mod containers often carry a `ContainerHeader`
+retoc cannot parse, and `to-legacy` then writes nothing at all without reporting a
+failure; the script notices the empty output and falls back to `unpack`. Supplying the
+game's `global.utoc` does not help, so those containers currently yield Zen-format cooked
+assets, which decode fine but are not yet a write-back target.
