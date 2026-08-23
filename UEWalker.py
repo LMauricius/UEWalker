@@ -2,9 +2,11 @@
 Walk an Unreal Engine mod folder and yield every editable texture inside it.
 
 Descends recursively: mod root -> .7z archives -> UE containers (.pak / .utoc+.ucas)
--> cooked Zen assets -> decoded .dds. Decoded textures and everything a later
-write-back pass needs are written under `OUT_DIR`, keyed by the same relative path
-that is yielded. See `ModWalker` / `fileIterator` for the public entry points.
+-> cooked Zen assets -> decoded .dds. Yielded files are temporary: they live in the
+walk's scratch tree and each dies as the next one is produced. `OUT_DIR` keeps only
+what outlives the walk, keyed by the same relative path that is yielded: the
+`backup-<name>` copies and the cooked trees a later write-back pass needs.
+See `ModWalker` / `fileIterator` for the public entry points.
 """
 
 from __future__ import annotations
@@ -544,20 +546,26 @@ class TextureDecoder:
         keys = [str(k) for k in self.provider.Files.Keys]
         return sorted(k for k in keys if k.lower().endswith(".uasset"))
 
-    def decode(self, key: str, dest: Path) -> list[Path]:
-        """Decode every texture export in one cooked package; returns the .dds written."""
+    def decode(self, key: str, dest: Path, meta: Path) -> list[Path]:
+        """
+        Decode every texture export in one cooked package; returns the .dds written.
+
+        `dest` takes the `.dds` the consumer edits, `meta` the sidecars the write-back
+        pass reads, so a scratch texture and its durable metadata can live apart.
+        """
         # Keys come from the provider's own index, so they always address a package.
         pkg_path = key.rsplit(".", 1)[0]
         log.debug("decoding package %s", pkg_path)
         package = self.provider.LoadPackage(pkg_path)
 
         dest.mkdir(parents=True, exist_ok=True)
+        meta.mkdir(parents=True, exist_ok=True)
         written: list[Path] = []
         for export in package.GetExports():
             mips = self._mips_of(export)
             if mips is None:
                 continue
-            written.append(self._write_texture(export, mips, dest, pkg_path))
+            written.append(self._write_texture(export, mips, dest, meta, pkg_path))
         log.debug("%s: %d texture(s) decoded", pkg_path, len(written))
         return sorted(written)
 
@@ -574,8 +582,8 @@ class TextureDecoder:
         mips = getattr(getattr(export, "PlatformData", None), "Mips", None)
         return mips if mips else None
 
-    def _write_texture(self, export, mips, dest: Path, pkg_path: str) -> Path:
-        """Write one export as `<name>.dds` plus its sidecar; returns the .dds path."""
+    def _write_texture(self, export, mips, dest: Path, meta: Path, pkg_path: str) -> Path:
+        """Write one export as `<name>.dds` in `dest` plus its sidecar in `meta`."""
         pixel_format = str(export.PlatformData.PixelFormat)
         if pixel_format not in PIXEL_FORMATS:
             raise RuntimeError(f"unsupported pixel format {pixel_format} in {pkg_path}")
@@ -615,7 +623,7 @@ class TextureDecoder:
             "dxgi_format": PIXEL_FORMATS[pixel_format][0],
             "mips": records,
         }
-        dds_path.with_suffix(".dds.json").write_text(json.dumps(sidecar, indent=2))
+        (meta / f"{dds_path.name}.json").write_text(json.dumps(sidecar, indent=2))
         return dds_path
 
 
@@ -634,13 +642,16 @@ class ModWalker:
     With `backup` on, an untouched `backup-<name>` copy of every yielded file is kept
     in the matching `out_dir` directory before the consumer sees it.
 
-    Lifetime: temp holds only intermediates (a container triplet), and each is deleted
-    as soon as retoc has read it, before any decoding starts, so one container's raw
-    payload is the peak. Extraction is batched per group (`selective` trades that back
-    for one member at a time). Nothing is extracted or delivered twice in one walk. Everything durable goes to `out_dir` under the yielded relative path: decoded
-    textures, their sidecars, and the cooked assets they came from, which a later
-    write-back pass needs. Loose images already on disk are yielded in place and never
-    copied, so consumers edit the real mod file.
+    Lifetime: everything yielded is temporary. Extracted members and decoded textures
+    land in the walk's scratch tree, and each is unlinked as the next file is yielded,
+    so a consumer has to do its work before asking for the next item. Container
+    triplets are temporary too, dropped as soon as this container's assets are decoded,
+    so one container's raw payload is the peak. Extraction is batched per group
+    (`selective` trades that back for one member at a time). Nothing is extracted or
+    delivered twice in one walk. `out_dir` keeps only what outlives the walk, under the
+    yielded relative path: the backups, and the cooked assets a later write-back pass
+    splices into. Loose images already on disk are yielded in place and never copied or
+    unlinked, so consumers edit the real mod file.
 
     Errors from a single archive, container or asset are logged and skipped.
     """
@@ -662,6 +673,9 @@ class ModWalker:
         #: unpacked, so nothing is extracted or delivered twice in one walk.
         self._seen: set[str] = set()
         self._done_containers: set[str] = set()
+        #: The scratch file last yielded, unlinked when the next one is delivered.
+        #: Loose mod images are yielded in place and never enter this.
+        self._live: Path | None = None
 
     # -- public API ---------------------------------------------------------
 
@@ -671,6 +685,9 @@ class ModWalker:
         self.out.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="modextract_") as tmp:
             self.tmp_root = Path(tmp)
+            #: Everything handed to the consumer, mirroring the yielded relative path.
+            self.work = self.tmp_root / "delivered"
+            self._live = None
             yield from self._walk_disk()
 
     # -- layer 1: the mod folder on disk -------------------------------------
@@ -783,8 +800,11 @@ class ModWalker:
         for asset in assets:
             asset_rel = join_rel(prefix, archive_segment(asset))
             with self._guard(asset_rel):
-                # Sidecars land beside the .dds; both stay for the write-back pass.
-                for image in decoder.decode(asset, self.out / asset_rel):
+                # The .dds is scratch; its sidecar is durable, next to the backup, so
+                # the write-back pass still knows where each mip goes.
+                for image in decoder.decode(
+                    asset, self.work / asset_rel, self.out / asset_rel
+                ):
                     yield from self._deliver(image, join_rel(asset_rel, image.name))
 
     # -- emission -------------------------------------------------------------
@@ -796,7 +816,7 @@ class ModWalker:
 
         if not members:
             return
-        dest = self.out / prefix
+        dest = self.work / prefix
         if self.selective and source.supports_selective:
             yield from self._emit_selective(source, members, dest, prefix)
         else:
@@ -850,22 +870,33 @@ class ModWalker:
 
     def _deliver(self, path: Path | str, rel: str) -> Iterator[WalkItem]:
         """
-        Back the file up if asked, then hand it to the consumer.
+        Back the file up if asked, retire the previous one, then hand it over.
 
-        The backup mirrors `rel` under `out`, so it sits beside the yielded file for
-        anything already in the output tree, and lands in the matching output
-        directory for a loose image yielded in place from the mod folder.
+        The backup mirrors `rel` under `out` and is the only copy that survives the
+        walk: the file yielded is scratch, and is unlinked the moment the next one is
+        delivered. Loose mod images are the exception, yielded in place and left alone.
         """
         if not self._claim(self._seen, rel, "file"):
             return
+        path = Path(path)
         if self.backup:
             rel_path = PurePosixPath(rel)
             backup = self.out / rel_path.parent / f"{BACKUP_PREFIX}{rel_path.name}"
             backup.parent.mkdir(parents=True, exist_ok=True)
             log.debug("backup %s", backup)
             shutil.copy2(path, backup)
+        self._retire()
+        if self.work in path.parents:  # scratch, so it dies with the next delivery
+            self._live = path
         log.info("yielding %s", rel)
         yield str(path), rel
+
+    def _retire(self) -> None:
+        """Unlink the scratch file yielded last; the consumer is done with it."""
+        if self._live is not None:
+            log.debug("retiring %s", self._live)
+            drop(self._live)
+            self._live = None
 
     # -- error handling -------------------------------------------------------
 
