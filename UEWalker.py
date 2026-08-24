@@ -47,6 +47,10 @@ UE_EXTS = {".pak", ".ucas", ".utoc"}
 #: Subdirectory of a container's output bundle holding the unpacked cooked assets.
 COOKED_DIR = "_cooked"
 
+#: Where a cooked tree is built before it is moved onto `COOKED_DIR`. Anything under
+#: this name is the leftover of an interrupted unpack, and is never read.
+COOKED_PARTIAL = f"{COOKED_DIR}.partial"
+
 #: Prefix marking an untouched copy. Also excluded from image scans, so a backup is
 #: never mistaken for a texture on a later pass over the same output directory.
 BACKUP_PREFIX = "backup-"
@@ -65,6 +69,11 @@ PIXEL_FORMATS = {
     "PF_G8":         (61, 1, False),   # R8_UNORM
     "PF_FloatRGBA":  (10, 8, False),   # R16G16B16A16_FLOAT
 }
+
+#: Linear DXGI format -> its sRGB twin. A cooked texture carries the colour space in
+#: its own SRGB flag rather than in the pixel format, so the two have to be recombined
+#: here: a colour map written as plain UNORM decodes, and resizes, as if it were linear.
+SRGB_DXGI = {71: 72, 74: 75, 77: 78, 98: 99, 87: 91, 28: 29}
 
 DDS_MAGIC = b"DDS "
 DDS_HEADER_SIZE = 124  # bytes after the magic, excluding the DX10 extension
@@ -98,6 +107,36 @@ def is_image(name: str) -> bool:
 def to_posix(internal: str) -> str:
     """Normalise an archive-internal member name to forward slashes."""
     return internal.replace("\\", "/")
+
+
+def write_json(path: Path, payload: object) -> None:
+    """
+    Write JSON so an interrupted run cannot leave a half file behind.
+
+    Sidecars outlive the walk and `skip_existing` trusts whatever is already there,
+    so a truncated one would be believed on every later run. The rename is atomic
+    within a directory: the file is either the previous content or the new one.
+    """
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, path)
+
+
+def read_json(path: Path) -> object | None:
+    """Parsed contents of a JSON file, or None if it is missing or truncated."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def tree_state(root: Path) -> set[tuple[str, int, int]]:
+    """Name, size and mtime of every file under `root`: enough to tell a write from a no-op."""
+    return {
+        (str(p), st.st_size, st.st_mtime_ns)
+        for p in root.rglob("*")
+        if p.is_file() and (st := p.stat())
+    }
 
 
 def drop(path: Path) -> None:
@@ -364,19 +403,74 @@ def run_tool(argv: list[str]) -> None:
         )
 
 
-def dds_bytes(pixel_format: str, width: int, height: int, mips: list[bytes]) -> bytes:
+def dxgi_of(pixel_format: str, srgb: bool) -> int:
+    """DXGI code for a UE pixel format, promoted to its sRGB twin where there is one."""
+    dxgi = PIXEL_FORMATS[pixel_format][0]
+    return SRGB_DXGI.get(dxgi, dxgi) if srgb else dxgi
+
+
+def mip_extent(width: int, height: int, level: int) -> tuple[int, int]:
+    """True dimensions of mip `level`, halving and stopping at 1 the way UE does."""
+    return max(1, width >> level), max(1, height >> level)
+
+
+def mip_nbytes(pixel_format: str, width: int, height: int) -> int:
+    """Payload size of one mip at those dimensions, in bytes."""
+    _, block, compressed = PIXEL_FORMATS[pixel_format]
+    if not compressed:
+        return width * height * block
+    return max(1, (width + 3) // 4) * max(1, (height + 3) // 4) * block
+
+
+def mip_chain_prefix(
+    pixel_format: str, sizes: list[tuple[int, int, int]]
+) -> tuple[int, str | None]:
+    """
+    How many leading mips form a DDS-legal chain, and why the rest were cut.
+
+    A DDS stores only a mip *count*: every level's dimensions and payload size are
+    derived by halving the top, so one missing or short mip silently shifts every
+    level after it. `sizes` is `(width, height, payload length)` per mip, in order;
+    the returned count is the longest prefix that matches the derived chain.
+
+    A block-compressed mip below 4x4 is reported either as its true size or clamped
+    to the block, depending on how the texture was cooked. Both describe the same
+    bytes, so both are accepted.
+    """
+    if not sizes:
+        return 0, "no mips"
+    compressed = PIXEL_FORMATS[pixel_format][2]
+    top_w, top_h, _ = sizes[0]
+    for level, (width, height, length) in enumerate(sizes):
+        true_w, true_h = mip_extent(top_w, top_h, level)
+        allowed = {(true_w, true_h)}
+        if compressed:
+            allowed.add((max(4, true_w), max(4, true_h)))
+        if (width, height) not in allowed:
+            return level, f"mip {level} is {width}x{height}, the chain expects {true_w}x{true_h}"
+        want = mip_nbytes(pixel_format, true_w, true_h)
+        if length != want:
+            return level, f"mip {level} ({true_w}x{true_h}) has {length} bytes, expected {want}"
+    return len(sizes), None
+
+
+def dds_bytes(
+    pixel_format: str, width: int, height: int, mips: list[bytes], srgb: bool = False
+) -> bytes:
     """
     Pack raw mip payloads into a DDS with a DX10 header.
 
     Mip bytes are written through untouched: this is a container swap, not a
     re-encode, so the edit stays reversible against the cooked original.
     """
-    dxgi, block, compressed = PIXEL_FORMATS[pixel_format]
+    dxgi = dxgi_of(pixel_format, srgb)
+    block, compressed = PIXEL_FORMATS[pixel_format][1:]
 
     # DDSD_CAPS|HEIGHT|WIDTH|PIXELFORMAT|MIPMAPCOUNT, plus LINEARSIZE or PITCH.
     flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000
     flags |= 0x80000 if compressed else 0x8
-    pitch = max(1, (width + 3) // 4) * block if compressed else width * block
+    # LINEARSIZE is the whole top surface, not one row of blocks; PITCH is one row.
+    pitch = mip_nbytes(pixel_format, width, height) if compressed else width * block
 
     # DDS_HEADER: 7 dwords, 44 reserved bytes, DDS_PIXELFORMAT (8 dwords),
     # 4 caps dwords, 1 reserved dword. 128 bytes with the magic.
@@ -479,17 +573,19 @@ class SevenZipSource(ArchiveSource):
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        #: POSIX-normalised member name -> the name py7zr matches `targets` against.
+        self._internal: dict[str, str] = {}
 
     def list_members(self) -> list[str]:
         with py7zr.SevenZipFile(self.path, "r") as z:
             infos = z.list()
-        names = [
-            to_posix(i.filename)
+        self._internal = {
+            to_posix(i.filename): i.filename
             for i in infos
             if not getattr(i, "is_directory", False)
-        ]
-        log.debug("%s: %d members", self.path, len(names))
-        return sorted(names)
+        }
+        log.debug("%s: %d members", self.path, len(self._internal))
+        return sorted(self._internal)
 
     def extract(self, members: list[str], dest: Path) -> None:
         # py7zr must reopen the archive per call; selective extraction of a solid
@@ -497,8 +593,11 @@ class SevenZipSource(ArchiveSource):
         log.debug(
             "extracting %d member(s) from %s -> %s", len(members), self.path, dest
         )
+        # Names are normalised for the walk's own bookkeeping, but py7zr matches
+        # `targets` against what the archive stores, so they go back as they came.
+        targets = [self._internal.get(m, m) for m in members]
         with py7zr.SevenZipFile(self.path, "r") as z:
-            z.extract(path=dest, targets=members)
+            z.extract(path=dest, targets=targets)
 
 
 class UEContainerSource(ArchiveSource):
@@ -532,10 +631,16 @@ class UEContainerSource(ArchiveSource):
             self.set_dir.rglob("*.utoc"), key=lambda p: patch_family(p.stem)[1]
         )
         if utocs:
-            for utoc in utocs:
-                self._from_iostore(utoc, dest)
-            if not any(dest.rglob("*.uasset")):
+            # `to-legacy` and `unpack` emit different asset formats, and `retoc to-zen`
+            # can only repack one of them: a family that came out as both is not a
+            # write-backable tree, so it is rejected rather than quietly kept.
+            modes = {self._from_iostore(utoc, dest) for utoc in utocs} - {None}
+            if not modes:
                 raise RuntimeError(f"retoc unpacked no packages from {self.set_dir}")
+            if len(modes) > 1:
+                raise RuntimeError(
+                    f"{self.set_dir}: patch family unpacked as both legacy and Zen assets"
+                )
             return
 
         # No .utoc: the set is already legacy, and retoc speaks IoStore only.
@@ -546,7 +651,7 @@ class UEContainerSource(ArchiveSource):
         run_tool([repak, "unpack", "-o", str(dest), str(pak)])
 
     @staticmethod
-    def _from_iostore(utoc: Path, dest: Path) -> None:
+    def _from_iostore(utoc: Path, dest: Path) -> str | None:
         """
         Get assets out of an IoStore container, preferring the legacy conversion.
 
@@ -561,20 +666,22 @@ class UEContainerSource(ArchiveSource):
         """
         aes = ["-a", AES_KEY] if AES_KEY else []
         # `dest` may already hold packages from an earlier container of the same patch
-        # family, so "did to-legacy write anything?" has to be asked as "did the set of
-        # packages grow?" rather than "is the tree non-empty?".
-        before = set(dest.rglob("*.uasset"))
+        # family, so "did to-legacy write anything?" has to be asked of the whole tree.
+        # Not of the set of package *paths*: a patch container usually replaces the
+        # packages it patches, leaving that set unchanged while every file is rewritten.
+        before = tree_state(dest)
         # -a is a global option and must precede the subcommand.
         run_tool([RETOC_PATH, *aes, "to-legacy", "--version", RETOC_VERSION,
                   str(utoc), str(dest)])
-        if set(dest.rglob("*.uasset")) != before:
-            return
+        if tree_state(dest) != before:
+            return "legacy"
 
         log.info(
             "%s: to-legacy produced no packages (unparsable container header?), "
             "falling back to unpack", utoc.name,
         )
         run_tool([RETOC_PATH, *aes, "unpack", str(utoc), str(dest)])
+        return "zen" if tree_state(dest) != before else None
 
 
 class CUE4Parse:
@@ -616,6 +723,7 @@ class CUE4Parse:
 
             from CUE4Parse.Compression import OodleHelper  # noqa: PLC0415
             from CUE4Parse.FileProvider import DefaultFileProvider  # noqa: PLC0415
+            from CUE4Parse.UE4.Assets.Exports.Texture import UTexture2D  # noqa: PLC0415
             from CUE4Parse.UE4.Versions import EGame, VersionContainer  # noqa: PLC0415
             from System.IO import DirectoryInfo, SearchOption  # noqa: PLC0415
 
@@ -641,6 +749,7 @@ class CUE4Parse:
 
         cls._types = {
             "DefaultFileProvider": DefaultFileProvider,
+            "UTexture2D": UTexture2D,
             "VersionContainer": VersionContainer,
             "EGame": EGame,
             "SearchOption": SearchOption,
@@ -725,11 +834,21 @@ class TextureDecoder:
         # decodes nothing (no texture export, or no reachable mip) must not leave an
         # empty `-extracted` directory behind in the output tree.
         written: list[Path] = []
+        taken: set[str] = set()
         for export in package.GetExports():
             mips = self._mips_of(export)
             if mips is None:
                 continue
-            written.append(self._write_texture(export, mips, dest, meta, pkg_path))
+            # Two exports of one package can share a name. They would otherwise write
+            # the same .dds, leaving the consumer the second one's bytes under the
+            # first one's name, so a repeat is suffixed rather than allowed to collide.
+            name = str(export.Name)
+            if name in taken:
+                name = f"{name}-{len(taken)}"
+                log.warning("%s: duplicate export name %s, writing as %s",
+                            pkg_path, export.Name, name)
+            taken.add(name)
+            written.append(self._write_texture(export, mips, name, dest, meta, pkg_path))
         log.debug("%s: %d texture(s) decoded", pkg_path, len(written))
         return sorted(written)
 
@@ -738,25 +857,37 @@ class TextureDecoder:
     @staticmethod
     def _mips_of(export):
         """
-        Mip list of an export, or None when it carries none.
+        Mip list of a 2D texture export, or None for anything else.
 
-        Every export holding mips is treated as a texture; no class check is made,
-        since the walk only cares about the payload, not the UObject type.
+        A cube, array or volume texture packs several surfaces into one mip payload,
+        which a plain 2D DDS cannot describe: written as one it would come out as a
+        single face at the wrong dimensions, so those are skipped whole. The test is
+        the .NET type rather than the export name, since `UTextureCube` and
+        `UTexture2DArray` derive from `UTexture` while every genuinely 2D class
+        (`UShadowMapTexture2D`, `UTextureFlipBook`, ...) derives from `UTexture2D`.
         """
         mips = getattr(getattr(export, "PlatformData", None), "Mips", None)
-        return mips if mips else None
+        if not mips:
+            return None
+        if not isinstance(export, CUE4Parse.types()["UTexture2D"]):
+            log.info("skipping %s: %s is not a 2D texture", export.Name, export.ExportType)
+            return None
+        return mips
 
-    def _write_texture(self, export, mips, dest: Path, meta: Path, pkg_path: str) -> Path:
+    def _write_texture(
+        self, export, mips, name: str, dest: Path, meta: Path, pkg_path: str
+    ) -> Path:
         """Write one export as `<name>.dds` in `dest` plus its sidecar in `meta`."""
         pixel_format = str(export.PlatformData.PixelFormat)
         if pixel_format not in PIXEL_FORMATS:
             raise RuntimeError(f"unsupported pixel format {pixel_format} in {pkg_path}")
+        # The colour space lives in the texture, not in the pixel format, and has to
+        # travel with it: a resize of an sRGB map filtered as linear shifts its colours.
+        srgb = bool(getattr(export, "SRGB", False))
 
         # Marshal each mip out of .NET once; bytes(...) copies the managed array.
         # A mip can parse yet carry no payload: an optional (`.uptnl`) or streamed one
-        # lives in a chunk that this mount does not have, and reads back as null. Only
-        # that mip is dropped, never the texture, and the sidecar keeps every surviving
-        # mip's own dimensions, so a gap in the chain cannot misalign the write-back.
+        # lives in a chunk that this mount does not have, and reads back as null.
         kept, payloads = [], []
         for mip in mips:
             data = mip.BulkData.Data
@@ -768,22 +899,36 @@ class TextureDecoder:
                 continue
             kept.append(mip)
             payloads.append(bytes(data))
+
+        # A DDS derives every level from the top one, so the chain has to be whole:
+        # a gap left by a dropped mip, or a payload that disagrees with its own
+        # dimensions, would silently shift every level after it. The chain is cut at
+        # that point instead, which costs the tail but keeps what is written exact.
+        sizes = [(m.SizeX, m.SizeY, len(p)) for m, p in zip(kept, payloads)]
+        usable, reason = mip_chain_prefix(pixel_format, sizes)
+        if usable < len(kept):
+            log.warning(
+                "%s: %s chain cut to %d of %d mips: %s",
+                pkg_path, export.Name, usable, len(kept), reason,
+            )
+        kept, payloads = kept[:usable], payloads[:usable]
         if not payloads:
-            raise RuntimeError(f"no mip payload reachable for {export.Name} in {pkg_path}")
+            raise RuntimeError(f"no usable mip payload for {export.Name} in {pkg_path}")
 
         mips, top = kept, kept[0]
         dest.mkdir(parents=True, exist_ok=True)
         meta.mkdir(parents=True, exist_ok=True)
-        dds_path = dest / f"{export.Name}.dds"
+        dds_path = dest / f"{name}.dds"
         log.debug(
-            "texture %s (%s %dx%d, %d mips)",
-            export.Name,
+            "texture %s (%s%s %dx%d, %d mips)",
+            name,
             pixel_format,
+            " sRGB" if srgb else "",
             top.SizeX,
             top.SizeY,
             len(mips),
         )
-        dds_path.write_bytes(dds_bytes(pixel_format, top.SizeX, top.SizeY, payloads))
+        dds_path.write_bytes(dds_bytes(pixel_format, top.SizeX, top.SizeY, payloads, srgb))
 
         # Sidecar: everything the write-back pass needs to place edited mips back into
         # the cooked payload. `offset` is into the .dds, so a resized edit can be
@@ -803,12 +948,17 @@ class TextureDecoder:
             "package": pkg_path,
             "export": str(export.Name),
             "pixel_format": pixel_format,
-            "dxgi_format": PIXEL_FORMATS[pixel_format][0],
+            "srgb": srgb,
+            "dxgi_format": dxgi_of(pixel_format, srgb),
             "mips": records,
         }
         sidecar_path = meta / f"{dds_path.name}.json"
-        if not (SKIP_EXISTING and sidecar_path.exists()):
-            sidecar_path.write_text(json.dumps(sidecar, indent=2))
+        # An existing sidecar is kept, but only if it is one this version wrote: a
+        # truncated leftover does not parse, and one written before the colour space
+        # was recorded has no `srgb` key and the wrong `dxgi_format` for an sRGB map.
+        current = read_json(sidecar_path)
+        if not (SKIP_EXISTING and isinstance(current, dict) and "srgb" in current):
+            write_json(sidecar_path, sidecar)
         return dds_path
 
 
@@ -928,6 +1078,10 @@ class ModWalker:
         for child in sorted(self.root.rglob("*")):
             if not child.is_file():
                 continue
+            # The output tree may sit inside the mod root: its backups and decoded
+            # textures are this walk's own product, not mod content to walk again.
+            if self.out in child.parents or child.name.startswith(BACKUP_PREFIX):
+                continue
             rel = child.relative_to(self.root).as_posix()
             log.debug("disk: %s", rel)
             if child.suffix.lower() in SEVENZIP_EXTS:
@@ -992,7 +1146,19 @@ class ModWalker:
         if self.skip_existing and cooked.is_dir() and any(cooked.rglob("*")):
             log.info("%s: cooked tree already unpacked", prefix)
             return cooked
-        UEContainerSource(set_dir).extract([], cooked)
+
+        # retoc merges into its output directory instead of replacing it, so a tree a
+        # killed run left half written would be merged into rather than redone -- and
+        # nothing in its contents says which kind it is. It is built under a name of
+        # its own and moved into place in one rename, so `_cooked` only ever exists
+        # finished: the remains of an interrupted run are the `.partial` directory,
+        # which is dropped here rather than read. The old tree is replaced only once
+        # the new one is whole, so a failed unpack leaves what was already there.
+        partial = cooked.with_name(COOKED_PARTIAL)
+        drop(partial)
+        UEContainerSource(set_dir).extract([], partial)
+        drop(cooked)
+        os.replace(partial, cooked)
         return cooked
 
     def _walk_ue(self, set_dir: Path, prefix: str) -> Iterator[WalkItem]:
@@ -1133,11 +1299,14 @@ class ModWalker:
         Under `skip_existing` a file already in the output is dropped here rather than
         yielded, so it is not backed up over either.
         """
-        if self._done(rel):
-            return
-        if not self._claim(self._seen, rel, "file"):
-            return
         path = Path(path)
+        if self._done(rel) or not self._claim(self._seen, rel, "file"):
+            # Nothing was delivered, so nothing will retire the scratch file made for
+            # it: on a resumed walk that is every texture in the mod, gigabytes of
+            # them, sitting in the scratch tree until the walk ends.
+            if self.work in path.parents:
+                drop(path)
+            return
         if self.backup:
             rel_path = PurePosixPath(rel)
             backup = self.out / rel_path.parent / f"{BACKUP_PREFIX}{rel_path.name}"

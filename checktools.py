@@ -197,6 +197,14 @@ def check_dds_writer() -> str:
     header = 4 + W.DDS_HEADER_SIZE + 20  # magic + DDS_HEADER + DDS_HEADER_DXT10
     if len(blob) != header + 16 or blob[header:] != b"".join(mips):
         raise RuntimeError("mip payload not written through verbatim")
+    # dwPitchOrLinearSize is the whole top surface, and an sRGB texture takes the
+    # sRGB twin of its format: both are read back rather than trusted.
+    linear = int.from_bytes(blob[20:24], "little")
+    if linear != W.mip_nbytes("PF_DXT1", 4, 4):
+        raise RuntimeError(f"linear size is {linear}, expected one 4x4 block")
+    srgb = W.dds_bytes("PF_DXT1", 4, 4, mips, srgb=True)
+    if int.from_bytes(srgb[128:132], "little") != 72:
+        raise RuntimeError("sRGB texture not written as BC1_UNORM_SRGB")
     return f"{header}-byte header + {len(mips)} mips"
 
 
