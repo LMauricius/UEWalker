@@ -4,17 +4,39 @@ Everything UEWalker needs beyond the Python standard library. Written for Ubuntu
 and derivatives (KDE neon included); other distributions differ only in the package
 manager lines.
 
-Four pieces are involved:
+Four pieces are involved, though only three of them are needed to walk a mod.
 
-| Dependency                              | Why                                                                                                           | Source                                                                                                                                        |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `py7zr`                                 | reads the mod's `.7z` archives                                                                                | `pip install py7zr` ([PyPI](https://pypi.org/project/py7zr/))                                                                                 |
-| `retoc`                                 | converts IoStore containers (`.utoc`/`.ucas`) to legacy cooked assets, and back again for the write-back pass | [github.com/trumank/retoc](https://github.com/trumank/retoc) ([releases](https://github.com/trumank/retoc/releases), prebuilt Linux binaries) |
-| .NET 10 + `pythonnet` + `CUE4Parse.dll` | reads cooked `Texture2D` assets and hands their raw mips to Python                                            | the [CUE4Parse](https://www.nuget.org/packages/CUE4Parse) NuGet package ([source](https://github.com/FabianFG/CUE4Parse))                     |
-| Oodle                                   | decompresses UE 4.26 container data on CUE4Parse's behalf                                                     |                                                                                                                                               |
+| Dependency                              | Why                                                                                          | Source                                                                                                                                        |
+| --------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `py7zr`                                 | unpacks the mod's `.7z` archives                                                             | `pip install py7zr` ([PyPI](https://pypi.org/project/py7zr/))                                                                                 |
+| .NET 10 + `pythonnet` + `CUE4Parse.dll` | mounts UE containers and hands the raw mips of a cooked `Texture2D` to Python                | the [CUE4Parse](https://www.nuget.org/packages/CUE4Parse) NuGet package ([source](https://github.com/FabianFG/CUE4Parse))                     |
+| Oodle                                   | decompresses UE 4.26 container data on CUE4Parse's behalf                                    |                                                                                                                                               |
+| `retoc`                                 | packs edited assets into an IoStore patch container, in a later pass; the walk never runs it | [github.com/trumank/retoc](https://github.com/trumank/retoc) ([releases](https://github.com/trumank/retoc/releases), prebuilt Linux binaries) |
 
-`repak` is a fifth, optional piece: it is needed only if a mod ships a legacy `.pak`
-with no `.utoc` beside it.
+`repak` is a fifth, optional piece, and it belongs to that same later pass: it is needed
+only if a mod ships a legacy `.pak` with no `.utoc` beside it, which retoc cannot write.
+
+## What actually gets unpacked
+
+A mod nests two different kinds of archive, and only the outer one is ever unpacked.
+
+The `.7z` files sitting in the mod folder are unpacked by py7zr, far enough to get the
+UE containers and the loose images out of them. The UE containers inside (a `.utoc`
+paired with its `.ucas`, or a legacy `.pak`) are never unpacked at all: CUE4Parse mounts
+them and reads packages straight out of the mount, so no cooked tree is written to disk
+and no external binary is involved.
+
+```mermaid
+flowchart LR
+    A[mod folder] -->|walked| B[".7z archive"]
+    B -->|py7zr unpacks| C["UE container<br>.utoc + .ucas"]
+    C -->|CUE4Parse mounts| D["cooked package"]
+    D -->|decoded in process| E[".dds you edit"]
+```
+
+That is why retoc and repak sit outside the walk. Here they are packers, not unpackers:
+they turn finished edits into a patch container, in a pass that runs long after the walk
+and is not implemented yet. A walk that never gets that far never touches either one.
 
 ## 1. Python packages
 
@@ -44,7 +66,8 @@ Add those two exports to your shell profile; `pythonnet` locates the runtime thr
 
 ## 3. retoc
 
-Prebuilt binaries are published per release. Pick the `x86_64-unknown-linux-gnu`
+Only the patch pass runs it, so a walk works without it; install it now anyway if you
+intend to build a mod out of your edits. Prebuilt binaries are published per release. Pick the `x86_64-unknown-linux-gnu`
 tarball:
 
 ```bash
@@ -158,7 +181,8 @@ RETOC_PATH    = "retoc"                                   # or an absolute path
 REPAK_PATH    = "repak"
 CUE4PARSE_DLL = "/home/you/Programs/CUE4Parse/CUE4Parse.dll"   # a publish output; `~` is not expanded
 GAME_PAKS     = "/path/to/game/End/Content/Paks"          # read only for global.utoc/.ucas
-BACKUP        = False                                     # True keeps a backup- copy of each file
+BACKUP        = False                                     # True keeps a backup- copy of each edit
+SKIP_EXISTING = True                                      # resume: skip what OUT_DIR already holds
 OODLE_LIB     = None                                      # None = let CUE4Parse fetch it
 AES_KEY       = None                                      # mod containers are normally plain
 RETOC_VERSION = "UE4_26"
@@ -174,29 +198,30 @@ instead of letting it guess. The file sits beside `CUE4Parse.dll` in the build o
 
 ```bash
 python checktools.py                  # every dependency, in the order the walk hits them
-python checktools.py /path/to/x.utoc  # plus a real unpack and decode
+python checktools.py /path/to/x.utoc  # plus a real mount and decode
 python UEWalker.py
 ```
 
 `checktools.py` prints one `ok` / `FAIL` / `skip` line per dependency and exits with the
-number of failures. It round-trips a small archive through py7zr, launches retoc and
-checks it supports the configured engine version, inspects the .NET layout before any
-CLR boot (hosting runtime present, publish output complete), then loads CUE4Parse and
-resolves the configured `EGame` member.
+number of failures. It round-trips a small archive through py7zr, inspects the .NET
+layout before any CLR boot (hosting runtime present, publish output complete), then
+loads CUE4Parse and resolves the configured `EGame` member. retoc and repak are checked
+too, but as skips: neither is on the walk's path.
 
 The lighter check `require_tools()` runs automatically at the start of every walk, so a
 misconfigured path fails immediately rather than halfway through a mod.
 
 ## Verification status
 
-`retoc` is confirmed against release v0.1.5: `to-legacy <utoc> <outdir>` and the global
-`-a/--aes-key` flag both match what the script calls.
-
 The CUE4Parse side is confirmed against a built assembly and a real mod, decoding 567
-textures to valid BC1 DX10 `.dds` files with matching sidecars.
+textures to valid BC1 DX10 `.dds` files with matching sidecars. That is the whole read
+path: the walk mounts each container through CUE4Parse and unpacks nothing. Saving the
+cooked source of an edited texture goes through the same provider (`TrySavePackage`,
+one package at a time), and is confirmed on a real container to return the Zen
+`.uasset` and `.ubulk` chunks intact.
 
-One rough edge remains on the retoc side. Mod containers often carry a `ContainerHeader`
-retoc cannot parse, and `to-legacy` then writes nothing at all without reporting a
-failure; the script notices the empty output and falls back to `unpack`. Supplying the
-game's `global.utoc` does not help, so those containers currently yield Zen-format cooked
-assets, which decode fine but are not yet a write-back target.
+`retoc` is confirmed present and working against release v0.1.5, and one rough edge is
+already known for the patch pass to deal with. Mod containers often carry a
+`ContainerHeader` retoc cannot parse; `to-legacy` then writes nothing at all without
+reporting a failure, and supplying the game's `global.utoc` does not help. Packing edits
+back into such a container will have to go through `unpack-raw` / `pack-raw` instead.

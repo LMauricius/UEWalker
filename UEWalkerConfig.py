@@ -2,19 +2,24 @@
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 #: Mod folder to walk. Overridden by argv[1] when run as a script.
 MOD_ROOT = "/path/to/mod"
 
-#: Durable output tree. Decoded textures, their sidecars and the cooked assets they
-#: came from are stored here under the yielded relative path.
+#: Output tree, owned by the consumer: it writes each edited texture here under the
+#: relative path it was yielded, keeping the name. The walk adds the `.dds.json`
+#: sidecars, a marker per finished container, and -- only where an edit appeared --
+#: the cooked package it came from, under `<container>/_cooked`.
 OUT_DIR = "/path/to/output"
 
-#: IoStore container unpacker. Prebuilt Linux binaries:
-#: https://github.com/trumank/retoc/releases
+#: IoStore container packer. The walk never runs it, since containers are read
+#: through CUE4Parse; it is the later patch pass that needs it, to build a `_P`
+#: container out of the edited assets and `_cooked` payloads in `OUT_DIR`.
+#: Prebuilt Linux binaries: https://github.com/trumank/retoc/releases
 RETOC_PATH = "retoc"
 
-#: Legacy .pak unpacker, needed only for sets that have no .utoc; retoc handles
-#: IoStore only. Leave as-is if the mod ships pure IoStore containers.
+#: Legacy `.pak` packer for that same pass, reached only by a container set with no
+#: `.utoc`, since retoc speaks IoStore only. Leave as-is for a pure IoStore mod.
 #: https://github.com/trumank/repak/releases
 REPAK_PATH = "repak"
 
@@ -54,12 +59,13 @@ UE_VERSION = "GAME_UE4_26"
 UEWALKER_DEBUG = True
 
 
-#: Keep an untouched copy of every yielded file as `backup-<name>` in `OUT_DIR`,
-#: so an edit can be compared against, or reverted to, the original.
+#: Keep an untouched copy of every file an edit reached, as `backup-<name>` beside
+#: the edit in `OUT_DIR`. A deliberate duplicate: the same mip bytes are already in
+#: that texture's `_cooked` payload, this is just the readable form of them.
 BACKUP = False
 
 
-#: Resume mode: treat `OUT_DIR` as work already done. An image whose real relative
-#: path is already there is neither extracted nor yielded, a container's cooked tree
-#: is unpacked only when missing, and an existing sidecar is left untouched.
+#: Resume mode: treat `OUT_DIR` as work already done. A container marked finished is
+#: skipped before its payload is extracted, and inside one that was interrupted, a
+#: file already at its relative path is neither decoded nor yielded again.
 SKIP_EXISTING = True

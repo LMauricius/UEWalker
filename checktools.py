@@ -2,11 +2,12 @@
 Check that every tool UEWalker depends on is present and actually works.
 
 Each check runs in the order the walk would reach it and prints `ok` / `FAIL`;
-the exit code is the number of failures. Optional checks (repak, and the live
-container check) report `skip` instead of failing.
+the exit code is the number of failures. Optional checks report `skip` instead of
+failing: retoc and repak, which only the later patch pass needs, and the live
+container check.
 
     python checktools.py                 # tools only
-    python checktools.py path/to/x.utoc  # also unpack and decode a real container
+    python checktools.py path/to/x.utoc  # also mount and decode a real container
 """
 
 from __future__ import annotations
@@ -54,6 +55,16 @@ def optional(name: str, fn) -> None:
         report(name, "skip", str(exc))
 
 
+def require_tool(configured: str, what: str) -> str:
+    """Resolve a configured binary against PATH, or raise naming it."""
+    found = shutil.which(configured) or (
+        configured if Path(configured).is_file() else None
+    )
+    if found is None:
+        raise RuntimeError(f"{what} not found: {configured!r} (see UEWalkerConfig)")
+    return found
+
+
 def tool_version(path: str) -> str:
     """First line `<path> --version` prints, for a binary already known to exist."""
     proc = subprocess.run([path, "--version"], capture_output=True, text=True)
@@ -97,7 +108,7 @@ def check_py7zr(tmp: Path) -> str:
 
 def check_retoc() -> str:
     """retoc is on disk, launches, and knows the configured engine version."""
-    path = W.require_tool(RETOC_PATH, "retoc")
+    path = require_tool(RETOC_PATH, "retoc")
     proc = subprocess.run([path, "to-zen", "--help"], capture_output=True, text=True)
     if RETOC_VERSION not in (proc.stdout + proc.stderr):
         raise RuntimeError(f"retoc does not list --version {RETOC_VERSION}")
@@ -197,34 +208,37 @@ def check_dds_writer() -> str:
     header = 4 + W.DDS_HEADER_SIZE + 20  # magic + DDS_HEADER + DDS_HEADER_DXT10
     if len(blob) != header + 16 or blob[header:] != b"".join(mips):
         raise RuntimeError("mip payload not written through verbatim")
-    # dwPitchOrLinearSize is the whole top surface, and an sRGB texture takes the
-    # sRGB twin of its format: both are read back rather than trusted.
+    # dwPitchOrLinearSize is the whole top surface, not one row of blocks.
     linear = int.from_bytes(blob[20:24], "little")
     if linear != W.mip_nbytes("PF_DXT1", 4, 4):
         raise RuntimeError(f"linear size is {linear}, expected one 4x4 block")
-    srgb = W.dds_bytes("PF_DXT1", 4, 4, mips, srgb=True)
-    if int.from_bytes(srgb[128:132], "little") != 72:
-        raise RuntimeError("sRGB texture not written as BC1_UNORM_SRGB")
+    # No format is ever written as its `_SRGB` twin: NVIDIA Texture Tools refuses to
+    # open those, and the colour space travels in the sidecar instead.
+    twins = {72, 75, 78, 91, 29, 99}
+    emitted = {W.dxgi_of(name) for name in W.PIXEL_FORMATS}
+    if emitted & twins:
+        raise RuntimeError(f"sRGB DXGI codes emitted: {sorted(emitted & twins)}")
     return f"{header}-byte header + {len(mips)} mips"
 
 
 def check_container(utoc: Path, tmp: Path) -> str:
-    """End-to-end on a real container: unpack it, then decode what came out."""
+    """End-to-end on a real container: mount it, then decode out of it."""
+
+    # The container set is copied whole: CUE4Parse reads the .ucas alongside its
+    # .utoc, and mounts the directory rather than an individual file.
     set_dir = tmp / "container"
     set_dir.mkdir()
     for sibling in utoc.parent.glob(utoc.stem + ".*"):
         shutil.copy2(sibling, set_dir)
 
-    cooked = tmp / "cooked"
-    W.UEContainerSource(set_dir).extract([], cooked)
-    assets = sorted(cooked.rglob("*.uasset"))
+    decoder = W.TextureDecoder(set_dir)
+    assets = decoder.packages()
     if not assets:
-        raise RuntimeError("unpacked, but no .uasset came out")
+        raise RuntimeError("mounted, but the index holds no .uasset")
 
     # Decode until one asset yields a texture: many packages hold no mips at all.
-    decoder = W.TextureDecoder(cooked)
     for asset in assets:
-        written = decoder.decode(asset, tmp / "dds")
+        written = decoder.decode(asset, tmp / "dds", tmp / "meta", lambda name: False)
         if written:
             return f"{len(assets)} assets, first texture {written[0].name}"
     return f"{len(assets)} assets, none holding textures"
@@ -240,9 +254,12 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="uewalker_check_") as tmp_name:
         tmp = Path(tmp_name)
         check("py7zr", lambda: check_py7zr(tmp))
-        check("retoc", check_retoc)
-        optional("repak (only for .pak-only sets)",
-                 lambda: tool_version(W.require_tool(REPAK_PATH, "repak")))
+        # The walk itself never runs either: both belong to the patch pass.
+        optional("retoc (only for the patch pass)", check_retoc)
+        optional(
+            "repak (only for .pak-only sets)",
+            lambda: tool_version(require_tool(REPAK_PATH, "repak")),
+        )
         check(".NET layout", check_dotnet_layout)
         check("CUE4Parse", check_cue4parse)
         check("DDS writer", check_dds_writer)

@@ -2,10 +2,14 @@
 Walk an Unreal Engine mod folder and yield every editable texture inside it.
 
 Descends recursively: mod root -> .7z archives -> UE containers (.pak / .utoc+.ucas)
--> cooked Zen assets -> decoded .dds. Yielded files are temporary: they live in the
-walk's scratch tree and each dies as the next one is produced. `OUT_DIR` keeps only
-what outlives the walk, keyed by the same relative path that is yielded: the
-`backup-<name>` copies and the cooked trees a later write-back pass needs.
+-> cooked Zen assets -> decoded .dds. Only the .7z layer is unpacked (py7zr); a UE
+container is mounted through CUE4Parse and read in place, so no cooked tree is written
+and no external binary is run. Yielded files are temporary: they live in the
+walk's scratch tree and each dies as the next one is produced. `OUT_DIR` belongs to
+the consumer: it writes its edited textures there under the yielded relative path, and
+the walker follows behind, keeping only what an edit makes worth keeping -- the cooked
+package it came from, and optionally a `backup-` copy of the original. Edits are turned
+into patch containers later, by a separate pass; nothing unedited is ever stored.
 See `ModWalker` / `fileIterator` for the public entry points.
 """
 
@@ -19,11 +23,9 @@ import re
 import shutil
 import signal
 import struct
-import subprocess
 import sys
 import tempfile
-from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -44,16 +46,18 @@ IMAGE_EXTS = {".png", ".dds", ".tga", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff", 
 SEVENZIP_EXTS = {".7z"}
 UE_EXTS = {".pak", ".ucas", ".utoc"}
 
-#: Subdirectory of a container's output bundle holding the unpacked cooked assets.
+#: Subdirectory of a container's output directory holding the cooked assets an edit
+#: has to be spliced back into. Only edited packages are ever written there.
 COOKED_DIR = "_cooked"
-
-#: Where a cooked tree is built before it is moved onto `COOKED_DIR`. Anything under
-#: this name is the leftover of an interrupted unpack, and is never read.
-COOKED_PARTIAL = f"{COOKED_DIR}.partial"
 
 #: Prefix marking an untouched copy. Also excluded from image scans, so a backup is
 #: never mistaken for a texture on a later pass over the same output directory.
 BACKUP_PREFIX = "backup-"
+
+#: Written into a container's output directory once every texture in it has been
+#: handed over without error. A container carrying it is skipped whole on a later
+#: walk, before its payload is extracted from the archive again.
+DONE_MARKER = ".uewalker-done"
 
 # UE pixel format -> (DXGI format, bytes per 4x4 block, block-compressed?).
 # Only the formats game textures actually ship in; anything else is skipped loudly.
@@ -70,10 +74,15 @@ PIXEL_FORMATS = {
     "PF_FloatRGBA":  (10, 8, False),   # R16G16B16A16_FLOAT
 }
 
-#: Linear DXGI format -> its sRGB twin. A cooked texture carries the colour space in
-#: its own SRGB flag rather than in the pixel format, so the two have to be recombined
-#: here: a colour map written as plain UNORM decodes, and resizes, as if it were linear.
-SRGB_DXGI = {71: 72, 74: 75, 77: 78, 98: 99, 87: 91, 28: 29}
+#: Every DXGI code above is the linear UNORM one, and a colour map keeps it even
+#: though the texture says otherwise. A cooked texture carries the colour space in its
+#: own SRGB flag rather than in its pixel format, and the honest reading would be the
+#: `_SRGB` twin (BC1 71 -> 72, BC3 77 -> 78, BC7 98 -> 99, ...); NVIDIA Texture Tools
+#: rejects every one of those outright ("this type of DDS file is not supported"),
+#: while accepting each UNORM code, so tagging the header honestly would cost us the
+#: only decompressor that reads these files. The bytes are identical either way: the
+#: twin differs only in how a reader interprets them. The flag itself is not lost, it
+#: travels in the sidecar (`srgb`), which is where the patch pass reads it anyway.
 
 DDS_MAGIC = b"DDS "
 DDS_HEADER_SIZE = 124  # bytes after the magic, excluding the DX10 extension
@@ -109,17 +118,24 @@ def to_posix(internal: str) -> str:
     return internal.replace("\\", "/")
 
 
-def write_json(path: Path, payload: object) -> None:
+def write_atomic(path: Path, payload: bytes) -> None:
     """
-    Write JSON so an interrupted run cannot leave a half file behind.
+    Write a durable file so an interrupted run cannot leave a half one behind.
 
-    Sidecars outlive the walk and `skip_existing` trusts whatever is already there,
-    so a truncated one would be believed on every later run. The rename is atomic
-    within a directory: the file is either the previous content or the new one.
+    Everything in `OUT_DIR` outlives the walk and `skip_existing` trusts whatever is
+    already there, so a truncated file would be believed on every later run. The
+    rename is atomic within a directory: the file is either the previous content or
+    the new one, never a prefix of it.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.write_bytes(payload)
     os.replace(tmp, path)
+
+
+def write_json(path: Path, payload: object) -> None:
+    """Write a JSON sidecar; see `write_atomic` for why it goes through a rename."""
+    write_atomic(path, json.dumps(payload, indent=2).encode())
 
 
 def read_json(path: Path) -> object | None:
@@ -128,15 +144,6 @@ def read_json(path: Path) -> object | None:
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-
-
-def tree_state(root: Path) -> set[tuple[str, int, int]]:
-    """Name, size and mtime of every file under `root`: enough to tell a write from a no-op."""
-    return {
-        (str(p), st.st_size, st.st_mtime_ns)
-        for p in root.rglob("*")
-        if p.is_file() and (st := p.stat())
-    }
 
 
 def drop(path: Path) -> None:
@@ -336,16 +343,6 @@ def global_dir() -> str | None:
     return _GLOBAL_DIR["path"]
 
 
-@contextmanager
-def work_dir(parent: Path) -> Iterator[Path]:
-    """Scratch directory under `parent`, removed on exit even if the generator is abandoned."""
-    path = Path(tempfile.mkdtemp(dir=parent))
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
-
-
 class ToolError(RuntimeError):
     """
     An internal tool is missing or cannot be loaded.
@@ -355,58 +352,18 @@ class ToolError(RuntimeError):
     """
 
 
-def tool_path(configured: str) -> str | None:
-    """Resolve a configured binary against PATH, or None if it is not there."""
-    return shutil.which(configured) or (configured if Path(configured).is_file() else None)
-
-
-def require_tool(configured: str, what: str) -> str:
-    """Resolved path to one binary, or a fatal `ToolError` naming it."""
-    found = tool_path(configured)
-    if found is None:
-        log.error("%s not found: %r (see UEWalkerConfig)", what, configured)
-        raise ToolError(f"{what} not found: {configured!r}")
-    return found
-
-
 def require_tools() -> None:
     """Fail early, and by name, if a configured dependency is missing."""
-    require_tool(RETOC_PATH, "container unpacker (retoc)")
+    # Only CUE4Parse: the walk reads containers through it and unpacks nothing, so
+    # retoc and repak are the later patch pass's problem, not this module's.
     if not Path(CUE4PARSE_DLL).is_file():
         log.error("CUE4Parse.dll not found: %r (see UEWalkerConfig)", CUE4PARSE_DLL)
         raise ToolError(f"CUE4Parse.dll not found: {CUE4PARSE_DLL!r}")
-    # REPAK_PATH is deliberately not checked here: it is only reached by a .pak-only
-    # set, and pure-IoStore mods never need it. It is still fatal when reached.
 
 
-def run_tool(argv: list[str]) -> None:
-    """
-    Run an external tool.
-
-    A tool that cannot be launched at all is a `ToolError` and aborts the walk; a
-    tool that ran and rejected its input is an ordinary failure of that one file.
-    """
-    log.debug("running: %s", " ".join(argv))
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True)
-    except OSError as exc:
-        log.error("cannot run %s: %s", argv[0], exc)
-        raise ToolError(f"cannot run {argv[0]}: {exc}") from exc
-    if proc.stdout and proc.stdout.strip():
-        log.debug("%s stdout: %s", argv[0], proc.stdout.strip())
-    if proc.stderr and proc.stderr.strip():
-        log.debug("%s stderr: %s", argv[0], proc.stderr.strip())
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        raise RuntimeError(
-            f"{argv[0]} failed ({proc.returncode}): {detail[-1] if detail else 'no output'}"
-        )
-
-
-def dxgi_of(pixel_format: str, srgb: bool) -> int:
-    """DXGI code for a UE pixel format, promoted to its sRGB twin where there is one."""
-    dxgi = PIXEL_FORMATS[pixel_format][0]
-    return SRGB_DXGI.get(dxgi, dxgi) if srgb else dxgi
+def dxgi_of(pixel_format: str) -> int:
+    """DXGI code a UE pixel format is written as; always the linear one (see the table)."""
+    return PIXEL_FORMATS[pixel_format][0]
 
 
 def mip_extent(width: int, height: int, level: int) -> tuple[int, int]:
@@ -454,16 +411,15 @@ def mip_chain_prefix(
     return len(sizes), None
 
 
-def dds_bytes(
-    pixel_format: str, width: int, height: int, mips: list[bytes], srgb: bool = False
-) -> bytes:
+def dds_bytes(pixel_format: str, width: int, height: int, mips: list[bytes]) -> bytes:
     """
     Pack raw mip payloads into a DDS with a DX10 header.
 
     Mip bytes are written through untouched: this is a container swap, not a
-    re-encode, so the edit stays reversible against the cooked original.
+    re-encode, so the edit stays reversible against the cooked original. The header
+    is deliberately colour-space-blind; `PIXEL_FORMATS` says why.
     """
-    dxgi = dxgi_of(pixel_format, srgb)
+    dxgi = dxgi_of(pixel_format)
     block, compressed = PIXEL_FORMATS[pixel_format][1:]
 
     # DDSD_CAPS|HEIGHT|WIDTH|PIXELFORMAT|MIPMAPCOUNT, plus LINEARSIZE or PITCH.
@@ -548,28 +504,13 @@ def group_ue_members(internals: Iterable[str]) -> list[UEContainerSet]:
 # Sources: one adapter per container kind
 # ---------------------------------------------------------------------------
 
-class ArchiveSource(ABC):
+class SevenZipSource:
     """
-    Adapter over one archive file on disk.
+    `.7z` archive read through py7zr.
 
-    Members are listed without extracting; extraction is then either selective
-    (one member at a time) or batch, depending on what the format supports.
+    Members are listed without extracting; extraction is then either selective (one
+    member at a time) or batch, depending on what the caller is trading off.
     """
-
-    #: False when the backing tool cannot extract a single member cheaply.
-    supports_selective = True
-
-    @abstractmethod
-    def list_members(self) -> list[str]:
-        """All non-directory member names, POSIX-normalised and ordered."""
-
-    @abstractmethod
-    def extract(self, members: list[str], dest: Path) -> None:
-        """Extract the given members below `dest`, preserving internal structure."""
-
-
-class SevenZipSource(ArchiveSource):
-    """`.7z` archive read through py7zr."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -598,90 +539,6 @@ class SevenZipSource(ArchiveSource):
         targets = [self._internal.get(m, m) for m in members]
         with py7zr.SevenZipFile(self.path, "r") as z:
             z.extract(path=dest, targets=targets)
-
-
-class UEContainerSource(ArchiveSource):
-    """
-    A UE container set already materialised on disk, unpacked via retoc.
-
-    Always batch: retoc converts a whole container, so single-asset extraction is
-    not available at this layer. Output is legacy cooked assets (.uasset/.uexp/.ubulk),
-    not images; `TextureDecoder` handles the step after this one.
-    """
-
-    supports_selective = False
-
-    def __init__(self, set_dir: Path) -> None:
-        self.set_dir = set_dir
-
-    def list_members(self) -> list[str]:
-        # Contents are unknown until the container is unpacked.
-        raise NotImplementedError("UE containers cannot be listed without unpacking")
-
-    def extract(self, members: list[str], dest: Path) -> None:
-        """`members` is ignored: the whole container set is converted/unpacked into `dest`."""
-        dest.mkdir(parents=True, exist_ok=True)
-
-        # retoc reads the .ucas alongside its .utoc, so only the index file is named.
-        # A patch family is several containers unpacked into one tree, in ascending
-        # priority so a patched package overwrites the one it replaces. One of them
-        # yielding nothing is normal (a patch carrying only optional mips has no
-        # packages of its own), so the set fails only when none of them yielded.
-        utocs = sorted(
-            self.set_dir.rglob("*.utoc"), key=lambda p: patch_family(p.stem)[1]
-        )
-        if utocs:
-            # `to-legacy` and `unpack` emit different asset formats, and `retoc to-zen`
-            # can only repack one of them: a family that came out as both is not a
-            # write-backable tree, so it is rejected rather than quietly kept.
-            modes = {self._from_iostore(utoc, dest) for utoc in utocs} - {None}
-            if not modes:
-                raise RuntimeError(f"retoc unpacked no packages from {self.set_dir}")
-            if len(modes) > 1:
-                raise RuntimeError(
-                    f"{self.set_dir}: patch family unpacked as both legacy and Zen assets"
-                )
-            return
-
-        # No .utoc: the set is already legacy, and retoc speaks IoStore only.
-        pak = next(self.set_dir.rglob("*.pak"), None)
-        if pak is None:
-            raise RuntimeError(f"no .pak/.utoc found in {self.set_dir}")
-        repak = require_tool(REPAK_PATH, "legacy .pak unpacker (repak)")
-        run_tool([repak, "unpack", "-o", str(dest), str(pak)])
-
-    @staticmethod
-    def _from_iostore(utoc: Path, dest: Path) -> str | None:
-        """
-        Get assets out of an IoStore container, preferring the legacy conversion.
-
-        `to-legacy` is tried first: it emits legacy .uasset/.uexp, which can still be
-        rewritten when an edit changes a texture's size, and `retoc to-zen` reverses
-        it. It resolves package names through the container header, though, and
-        mod-authored containers frequently ship one retoc cannot parse -- it then
-        reports `packages: 0` and silently writes nothing at all.
-
-        `unpack` is the fallback: it works off the directory index instead, which
-        survives in those containers, at the cost of emitting Zen-format assets.
-        """
-        aes = ["-a", AES_KEY] if AES_KEY else []
-        # `dest` may already hold packages from an earlier container of the same patch
-        # family, so "did to-legacy write anything?" has to be asked of the whole tree.
-        # Not of the set of package *paths*: a patch container usually replaces the
-        # packages it patches, leaving that set unchanged while every file is rewritten.
-        before = tree_state(dest)
-        # -a is a global option and must precede the subcommand.
-        run_tool([RETOC_PATH, *aes, "to-legacy", "--version", RETOC_VERSION,
-                  str(utoc), str(dest)])
-        if tree_state(dest) != before:
-            return "legacy"
-
-        log.info(
-            "%s: to-legacy produced no packages (unparsable container header?), "
-            "falling back to unpack", utoc.name,
-        )
-        run_tool([RETOC_PATH, *aes, "unpack", str(utoc), str(dest)])
-        return "zen" if tree_state(dest) != before else None
 
 
 class CUE4Parse:
@@ -764,20 +621,24 @@ class TextureDecoder:
     Cooked `Texture2D` -> editable `.dds`, through CUE4Parse in-process.
 
     The provider is mounted on the container directory (the `.utoc`/`.ucas`/`.pak`
-    set itself), not on retoc's unpacked tree: CUE4Parse reads IoStore/Zen natively,
-    while `retoc unpack` output has no legacy package header and cannot be parsed as
-    loose assets. One provider is mounted per container and reused for every asset in
-    it, so the mount cost is paid once. Each texture is written as a `.dds` holding the raw BC
-    mip chain plus a `<name>.dds.json` sidecar recording pixel format and mip layout.
-    Mip bytes are copied, never re-encoded, so a later write-back pass can splice
-    edited mips into the retained cooked asset.
+    set itself): CUE4Parse reads IoStore/Zen natively, so the container never has to
+    be unpacked first. One provider is mounted per container and reused for every
+    asset in it, so the mount cost is paid once. Each texture is written as a `.dds`
+    holding the raw BC mip chain plus a `<name>.dds.json` sidecar recording pixel
+    format and mip layout. Mip bytes are copied, never re-encoded, so the patch pass
+    can splice an edited mip straight back into the cooked payload.
+
+    `save_package` is the other half: the cooked bytes of one package, for the assets
+    an edit actually reached. It is what the patch pass splices edited mips into.
 
     CUE4Parse is read-only; nothing here writes back into the container.
     """
 
-    def __init__(self, mount: Path) -> None:
+    def __init__(self, mount: Path, skip_existing: bool = SKIP_EXISTING) -> None:
         #: Directory holding the container set, used as the provider's mount point.
         self.mount = mount
+        #: Leave a cooked file that is already on disk alone; see `save_package`.
+        self.skip_existing = skip_existing
         self._provider = None
 
     @property
@@ -818,12 +679,16 @@ class TextureDecoder:
         keys = [str(k) for k in self.provider.Files.Keys]
         return sorted(k for k in keys if k.lower().endswith(".uasset"))
 
-    def decode(self, key: str, dest: Path, meta: Path) -> list[Path]:
+    def decode(
+        self, key: str, dest: Path, meta: Path, done: Callable[[str], bool]
+    ) -> list[Path]:
         """
         Decode every texture export in one cooked package; returns the .dds written.
 
-        `dest` takes the `.dds` the consumer edits, `meta` the sidecars the write-back
-        pass reads, so a scratch texture and its durable metadata can live apart.
+        `dest` takes the `.dds` the consumer edits, `meta` the sidecars the patch pass
+        reads, so a scratch texture and its durable metadata can live apart. `done` is
+        asked about each `.dds` name before any of its payload is touched, so a texture
+        the consumer has already dealt with costs nothing but the package load.
         """
         # Keys come from the provider's own index, so they always address a package.
         pkg_path = key.rsplit(".", 1)[0]
@@ -848,9 +713,41 @@ class TextureDecoder:
                 log.warning("%s: duplicate export name %s, writing as %s",
                             pkg_path, export.Name, name)
             taken.add(name)
+            if done(f"{name}.dds"):
+                continue
             written.append(self._write_texture(export, mips, name, dest, meta, pkg_path))
         log.debug("%s: %d texture(s) decoded", pkg_path, len(written))
         return sorted(written)
+
+    def save_package(self, key: str, root: Path) -> list[Path]:
+        """
+        Write one package's cooked files below `root`, keyed by their package path.
+
+        The provider hands back the chunks as they sit in the container (Zen format:
+        `.uasset` plus `.ubulk`, no `.uexp`), which is what `retoc unpack` would have
+        produced from the whole container -- one package at a time, and without
+        unpacking or re-extracting anything.
+        """
+        ok, data = self.provider.TrySavePackage(key)
+        if not ok:
+            raise RuntimeError(f"no cooked payload for {key}")
+
+        written: list[Path] = []
+        for name in data.Keys:
+            # Package paths come from the provider index and address the mount, but
+            # they end up joined onto a durable directory: anything that could climb
+            # out of it is refused rather than trusted.
+            rel = PurePosixPath(to_posix(str(name)))
+            if rel.is_absolute() or ".." in rel.parts:
+                raise RuntimeError(f"unsafe package path {name!r} in {key}")
+            path = root / rel
+            if self.skip_existing and path.is_file():
+                log.debug("cooked %s already saved", rel)
+                continue
+            write_atomic(path, bytes(data[name]))
+            log.debug("cooked %s (%d bytes)", rel, path.stat().st_size)
+            written.append(path)
+        return written
 
     # -- extraction from the object model -------------------------------------
 
@@ -928,7 +825,7 @@ class TextureDecoder:
             top.SizeY,
             len(mips),
         )
-        dds_path.write_bytes(dds_bytes(pixel_format, top.SizeX, top.SizeY, payloads, srgb))
+        dds_path.write_bytes(dds_bytes(pixel_format, top.SizeX, top.SizeY, payloads))
 
         # Sidecar: everything the write-back pass needs to place edited mips back into
         # the cooked payload. `offset` is into the .dds, so a resized edit can be
@@ -948,16 +845,18 @@ class TextureDecoder:
             "package": pkg_path,
             "export": str(export.Name),
             "pixel_format": pixel_format,
+            # The two disagree on purpose for a colour map: `dxgi_format` is what the
+            # .dds header really says, `srgb` what the cooked texture says, and the
+            # patch pass restores the flag from the latter.
             "srgb": srgb,
-            "dxgi_format": dxgi_of(pixel_format, srgb),
+            "dxgi_format": dxgi_of(pixel_format),
             "mips": records,
         }
         sidecar_path = meta / f"{dds_path.name}.json"
-        # An existing sidecar is kept, but only if it is one this version wrote: a
-        # truncated leftover does not parse, and one written before the colour space
-        # was recorded has no `srgb` key and the wrong `dxgi_format` for an sRGB map.
-        current = read_json(sidecar_path)
-        if not (SKIP_EXISTING and isinstance(current, dict) and "srgb" in current):
+        # Rewritten whenever it would not come out identical, which covers a truncated
+        # leftover (it does not parse) and one an older version wrote with different
+        # fields, without needing to know which version that was.
+        if read_json(sidecar_path) != sidecar:
             write_json(sidecar_path, sidecar)
         return dds_path
 
@@ -974,14 +873,20 @@ class ModWalker:
     `<name><ext>-extracted` segment, and a cooked asset adds one too, so a nested
     texture reads as `abc.7z-extracted/def.utoc-extracted/Game/Foo.uasset-extracted/Foo.dds`.
 
-    With `backup` on, an untouched `backup-<name>` copy of every yielded file is kept
-    in the matching `out_dir` directory before the consumer sees it.
+    The consumer owns `out_dir`: it writes its edited version of a yielded file there,
+    under the same relative path and the same name, before asking for the next file.
+    The walker follows behind it. Every texture gets its `.dds.json` sidecar, and a
+    container handed over whole gets a `.uewalker-done` marker; beyond that, only an
+    edit makes anything worth storing. When one appears, the cooked package it was
+    decoded from is written into `<container>/_cooked`, and with `backup` on the
+    untouched original is kept beside the edit as `backup-<name>`. An unedited texture
+    costs nothing but its sidecar.
 
-    With `skip_existing` on, `out_dir` is read as the record of a previous walk: an
-    image already there under its own relative path is skipped (not extracted, not
-    yielded), a cooked tree is unpacked only when it is missing, and an existing
-    sidecar is kept. Interrupted walks resume with it; it is off by default, since a
-    consumer that writes its results elsewhere would see nothing skipped anyway.
+    With `skip_existing` on, `out_dir` is read back as the record of previous walks.
+    A container whose marker is there is skipped before its payload leaves the
+    archive; inside one that was interrupted, a file already sitting under its own
+    relative path is skipped too, so its texture is never decoded and its member never
+    extracted. Interrupted walks resume with it.
 
     Lifetime: everything yielded is temporary. Extracted members and decoded textures
     land in the walk's scratch tree, and each is unlinked as the next file is yielded,
@@ -989,10 +894,8 @@ class ModWalker:
     triplets are temporary too, dropped as soon as this container's assets are decoded,
     so one container's raw payload is the peak. Extraction is batched per group
     (`selective` trades that back for one member at a time). Nothing is extracted or
-    delivered twice in one walk. `out_dir` keeps only what outlives the walk, under the
-    yielded relative path: the backups, and the cooked assets a later write-back pass
-    splices into. Loose images already on disk are yielded in place and never copied or
-    unlinked, so consumers edit the real mod file.
+    delivered twice in one walk. Loose images already on disk are yielded in place and
+    never copied or unlinked, so consumers edit the real mod file.
 
     The scratch tree is released when the walk ends, however it ends: exhausted,
     closed, abandoned, killed by SIGTERM, or left behind by a process that crashed
@@ -1015,17 +918,22 @@ class ModWalker:
         #: One extract call per member instead of one per group. Bounds peak disk on a
         #: huge archive, at the cost of re-decoding a solid archive once per member.
         self.selective = selective
+        #: Keep an untouched `backup-<name>` copy of every file an edit reached.
         self.backup = backup
         #: Resume mode: anything already sitting in `out` under its yielded relative
         #: path counts as done, and is neither redone nor delivered again.
         self.skip_existing = skip_existing
         #: Relative paths already handed to the consumer, and container sets already
-        #: unpacked, so nothing is extracted or delivered twice in one walk.
+        #: walked, so nothing is extracted or delivered twice in one walk.
         self._seen: set[str] = set()
         self._done_containers: set[str] = set()
-        #: Files skipped as already present in `out`. Only read as a delta, to tell a
-        #: container that decoded nothing from one whose textures were all done before.
-        self._skipped = 0
+        #: Container assets whose cooked payload has been written, keyed by the asset's
+        #: relative path rather than its package path: a patch container can carry its
+        #: own version of a package a base container also holds.
+        self._cooked: set[str] = set()
+        #: Failures swallowed by `_guard`. Read as a delta, so a container that lost
+        #: an asset is not marked done and is retried by the next walk.
+        self._failed = 0
         #: The scratch file last yielded, unlinked when the next one is delivered.
         #: Loose mod images are yielded in place and never enter this.
         self._live: Path | None = None
@@ -1078,8 +986,9 @@ class ModWalker:
         for child in sorted(self.root.rglob("*")):
             if not child.is_file():
                 continue
-            # The output tree may sit inside the mod root: its backups and decoded
-            # textures are this walk's own product, not mod content to walk again.
+            # The output tree may sit inside the mod root: the consumer's edits, the
+            # backups and the cooked sources are this walk's own product, not mod
+            # content to walk again.
             if self.out in child.parents or child.name.startswith(BACKUP_PREFIX):
                 continue
             rel = child.relative_to(self.root).as_posix()
@@ -1117,106 +1026,81 @@ class ModWalker:
                 yield from self._walk_ue_group(source, group, prefix)
 
     def _walk_ue_group(
-        self, source: ArchiveSource, group: UEContainerSet, prefix: str
+        self, source: SevenZipSource, group: UEContainerSet, prefix: str
     ) -> Iterator[WalkItem]:
-        """Materialise one container set out of the .7z, then descend into it."""
+        """
+        Materialise one container set out of the .7z, then decode straight out of it.
+
+        The marker is checked first and written last, so a container is extracted at
+        most once across all walks: hundreds of megabytes of payload for a set whose
+        textures are already dealt with. It is written only when the group was walked
+        to its end with nothing swallowed by `_guard`, so a lost asset (or an abandoned
+        iterator) leaves the container to be retried rather than silently dropped.
+        """
         set_prefix = join_rel(prefix, group.segment)
         if not self._claim(self._done_containers, set_prefix, "container"):
             return
+        marker = self.out / set_prefix / DONE_MARKER
+        if self.skip_existing and marker.exists():
+            log.info("skipping container %s: already processed", set_prefix)
+            return
 
-        # The triplet is temp-only: `retoc to-zen` rebuilds it from the cooked tree on
-        # the way back, so persisting it would just duplicate the mod. It has to outlive
-        # retoc, though: the decoder reads the container directly, so it is dropped only
-        # once this container's assets are done. Still one container's worth at a time.
+        log.info("container %s", set_prefix)
+        # The triplet is temp-only: the mod already holds it, and the patch pass
+        # re-extracts the one container it needs. It has to outlive the decode, though,
+        # since the decoder reads the container directly rather than an unpacked tree.
+        # Still one container's worth at a time.
         set_dir = Path(tempfile.mkdtemp(dir=self.tmp_root))
+        failed = self._failed
         try:
             source.extract(group.internal_names(), set_dir)
-            yield from self._walk_ue(set_dir, set_prefix)
+            yield from self._walk_assets(set_dir, set_prefix)
         finally:
             shutil.rmtree(set_dir, ignore_errors=True)
 
-    # -- layer 3: a UE container set -----------------------------------------
+        if self._failed == failed:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
 
-    def _unpack_ue(self, set_dir: Path, prefix: str) -> Path:
-        """Unpack the container into its output bundle for write-back; returns the root."""
-        log.info("container %s", prefix)
-        cooked = self.out / prefix / COOKED_DIR
-        # A cooked tree only ever depends on the container it came from, so an existing
-        # one is the same tree retoc would write again; unpacking is the expensive half.
-        if self.skip_existing and cooked.is_dir() and any(cooked.rglob("*")):
-            log.info("%s: cooked tree already unpacked", prefix)
-            return cooked
-
-        # retoc merges into its output directory instead of replacing it, so a tree a
-        # killed run left half written would be merged into rather than redone -- and
-        # nothing in its contents says which kind it is. It is built under a name of
-        # its own and moved into place in one rename, so `_cooked` only ever exists
-        # finished: the remains of an interrupted run are the `.partial` directory,
-        # which is dropped here rather than read. The old tree is replaced only once
-        # the new one is whole, so a failed unpack leaves what was already there.
-        partial = cooked.with_name(COOKED_PARTIAL)
-        drop(partial)
-        UEContainerSource(set_dir).extract([], partial)
-        drop(cooked)
-        os.replace(partial, cooked)
-        return cooked
-
-    def _walk_ue(self, set_dir: Path, prefix: str) -> Iterator[WalkItem]:
-        """
-        Unpack a container set for write-back, then decode straight out of it.
-
-        retoc's cooked tree is the write-back target only; the textures come from the
-        container through CUE4Parse. Neither side blocks the other: an unusable cooked
-        tree is dropped and decoding goes on without it, and if nothing decodes the
-        tree is dead weight (nothing to splice back in), so the whole bundle goes.
-        """
-        # An unusable cooked tree does not stop the textures from being decoded; it
-        # only means there is nothing to splice them back into, so it is not kept.
-        cooked = None
-        with self._guard(join_rel(prefix, COOKED_DIR)):
-            cooked = self._unpack_ue(set_dir, prefix)
-        if cooked is not None and not any(cooked.rglob("*")):
-            cooked = None
-        if cooked is None:
-            log.warning("%s: no cooked tree, textures will not be write-backable", prefix)
-            drop(self.out / prefix / COOKED_DIR)
-
-        delivered = 0
-        skipped = self._skipped
-        try:
-            for item in self._walk_assets(set_dir, prefix):
-                delivered += 1
-                yield item
-        finally:
-            # Skips count as deliveries here: a container whose textures were all done
-            # by an earlier walk has an output bundle worth keeping, not an empty one.
-            if not delivered and self._skipped == skipped:
-                log.info("%s: nothing decoded, dropping the output bundle", prefix)
-                shutil.rmtree(self.out / prefix, ignore_errors=True)
-
-    # -- layer 4: cooked assets ----------------------------------------------
+    # -- layer 3: cooked assets ----------------------------------------------
 
     def _walk_assets(self, mount: Path, prefix: str) -> Iterator[WalkItem]:
         """Decode every package in the container at `mount`, one at a time."""
-        decoder = TextureDecoder(mount)  # mounts once, reused for every asset below
+        # Mounts once, reused for every asset below.
+        decoder = TextureDecoder(mount, self.skip_existing)
+        cooked = self.out / prefix / COOKED_DIR
         # Assets come from the provider's own index, which is the only authority on
         # what the container holds and how its packages are addressed.
         assets = decoder.packages()
         log.debug("%s: %d cooked asset(s)", prefix, len(assets))
         for asset in assets:
             asset_rel = join_rel(prefix, archive_segment(asset))
+            # Saved at most once even when several edited exports share the package:
+            # its `.ubulk` is the whole mip chain, so a repeat is megabytes of nothing.
+            # Both captures are explicit: this runs when the consumer asks for the next
+            # file, and reading the loop variables then would be reading a moving target.
+            def save_cooked(key: str = asset, claim: str = asset_rel) -> None:
+                if self._claim(self._cooked, claim, "cooked package"):
+                    decoder.save_package(key, cooked)
+
             with self._guard(asset_rel):
-                # The .dds is scratch; its sidecar is durable, next to the backup, so
-                # the write-back pass still knows where each mip goes.
+                # The .dds is scratch; its sidecar is durable, so the patch pass still
+                # knows where each mip goes. `_done` runs inside the decoder, before a
+                # skipped texture's mips are marshalled out of .NET at all.
                 for image in decoder.decode(
-                    asset, self.work / asset_rel, self.out / asset_rel
+                    asset,
+                    self.work / asset_rel,
+                    self.out / asset_rel,
+                    lambda name: self._done(join_rel(asset_rel, name)),
                 ):
-                    yield from self._deliver(image, join_rel(asset_rel, image.name))
+                    yield from self._deliver(
+                        image, join_rel(asset_rel, image.name), save_cooked
+                    )
 
     # -- emission -------------------------------------------------------------
 
     def _emit(
-        self, source: ArchiveSource, members: list[str], prefix: str
+        self, source: SevenZipSource, members: list[str], prefix: str
     ) -> Iterator[WalkItem]:
         """Extract and yield `members` into the output tree, selectively or in one batch."""
 
@@ -1227,13 +1111,13 @@ class ModWalker:
         if not members:
             return
         dest = self.work / prefix
-        if self.selective and source.supports_selective:
+        if self.selective:
             yield from self._emit_selective(source, members, dest, prefix)
         else:
             yield from self._emit_batch(source, members, dest, prefix)
 
     def _emit_selective(
-        self, source: ArchiveSource, members: list[str], dest: Path, prefix: str
+        self, source: SevenZipSource, members: list[str], dest: Path, prefix: str
     ) -> Iterator[WalkItem]:
         """One member per extraction: cheapest on disk, costliest on a solid archive."""
 
@@ -1247,7 +1131,7 @@ class ModWalker:
             drop(dest / internal)
 
     def _emit_batch(
-        self, source: ArchiveSource, members: list[str], dest: Path, prefix: str
+        self, source: SevenZipSource, members: list[str], dest: Path, prefix: str
     ) -> Iterator[WalkItem]:
         """One extraction for the whole group; a solid archive is decoded only once."""
 
@@ -1280,24 +1164,25 @@ class ModWalker:
 
     def _done(self, rel: str) -> bool:
         """True when `skip_existing` and `rel` is already in the output tree."""
-        # The real relative path, not the `backup-<name>` copy beside it: what counts
-        # as done is the image the consumer wrote back, not the untouched original.
+        # The consumer writes its result under the relative path it was yielded, and
+        # under the same name, so the file being there is the record that it ran.
         if not self.skip_existing or not (self.out / rel).exists():
             return False
         log.info("skipping %s: already in the output", rel)
-        self._skipped += 1
         return True
 
-    def _deliver(self, path: Path | str, rel: str) -> Iterator[WalkItem]:
+    def _deliver(
+        self, path: Path | str, rel: str, save_cooked: Callable[[], None] | None = None
+    ) -> Iterator[WalkItem]:
         """
-        Back the file up if asked, retire the previous one, then hand it over.
+        Retire the previously yielded file, hand this one over, then harvest it.
 
-        The backup mirrors `rel` under `out` and is the only copy that survives the
-        walk: the file yielded is scratch, and is unlinked the moment the next one is
+        The file yielded is scratch, and is unlinked the moment the next one is
         delivered. Loose mod images are the exception, yielded in place and left alone.
 
         Under `skip_existing` a file already in the output is dropped here rather than
-        yielded, so it is not backed up over either.
+        yielded. Textures are caught earlier, in the decoder, so what reaches this is
+        an archive member or a loose image.
         """
         path = Path(path)
         if self._done(rel) or not self._claim(self._seen, rel, "file"):
@@ -1307,17 +1192,56 @@ class ModWalker:
             if self.work in path.parents:
                 drop(path)
             return
-        if self.backup:
-            rel_path = PurePosixPath(rel)
-            backup = self.out / rel_path.parent / f"{BACKUP_PREFIX}{rel_path.name}"
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            log.debug("backup %s", backup)
-            shutil.copy2(path, backup)
+        # A loose mod image is edited in place, so its original has to be copied out
+        # before the consumer sees it. Everything else is scratch and stays untouched
+        # while the consumer works, so it can be copied afterwards, and only if needed.
+        in_place = self.work not in path.parents
+        if self.backup and in_place:
+            self._backup(path, rel)
         self._retire()
-        if self.work in path.parents:  # scratch, so it dies with the next delivery
+        if not in_place:  # scratch, so it dies with the next delivery
             self._live = path
         log.info("yielding %s", rel)
         yield str(path), rel
+
+        # Resumed: the consumer has finished with this file and written its result.
+        self._harvest(path, rel, in_place, save_cooked)
+
+    def _harvest(
+        self,
+        path: Path,
+        rel: str,
+        in_place: bool,
+        save_cooked: Callable[[], None] | None,
+    ) -> None:
+        """
+        Keep what the consumer's edit made worth keeping, and nothing else.
+
+        The edit appearing at `rel` is the signal: everything is a patch, so an
+        untouched texture must leave nothing behind but its sidecar. The container is
+        still mounted and its triplet still on disk at this point (a generator resumes
+        innermost first, so this runs before the walk unwinds out of the container),
+        which is what lets the cooked package be pulled now instead of re-extracted
+        from the mod months later.
+        """
+        if not (self.out / rel).is_file():
+            log.debug("%s: not edited, nothing to keep", rel)
+            return
+        log.info("harvesting %s", rel)
+        if self.backup and not in_place:
+            self._backup(path, rel)
+        if save_cooked is not None:
+            save_cooked()
+
+    def _backup(self, path: Path, rel: str) -> None:
+        """Copy a file to `backup-<name>` beside where its edit goes in the output."""
+        rel_path = PurePosixPath(rel)
+        backup = self.out / rel_path.parent / f"{BACKUP_PREFIX}{rel_path.name}"
+        if self.skip_existing and backup.is_file():
+            return
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        log.debug("backup %s", backup)
+        shutil.copy2(path, backup)
 
     def _retire(self) -> None:
         """Unlink the scratch file yielded last; the consumer is done with it."""
@@ -1336,6 +1260,9 @@ class ModWalker:
         except ToolError:
             raise  # a broken tool breaks every remaining file: abort, do not skip
         except Exception as exc:  # noqa: BLE001 - a bad archive must not abort the walk
+            # Counted as well as logged: a container that lost an asset here must not
+            # be marked done, or the next walk would skip it with the asset missing.
+            self._failed += 1
             log.warning("skipping %s: %s: %s", what, type(exc).__name__, exc)
             log.debug("traceback for %s", what, exc_info=True)
 
