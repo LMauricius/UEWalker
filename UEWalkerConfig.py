@@ -57,3 +57,9 @@ UEWALKER_DEBUG = True
 #: Keep an untouched copy of every yielded file as `backup-<name>` in `OUT_DIR`,
 #: so an edit can be compared against, or reverted to, the original.
 BACKUP = False
+
+
+#: Resume mode: treat `OUT_DIR` as work already done. An image whose real relative
+#: path is already there is neither extracted nor yielded, a container's cooked tree
+#: is unpacked only when missing, and an existing sidecar is left untouched.
+SKIP_EXISTING = True

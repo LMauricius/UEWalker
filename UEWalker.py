@@ -623,7 +623,9 @@ class TextureDecoder:
             "dxgi_format": PIXEL_FORMATS[pixel_format][0],
             "mips": records,
         }
-        (meta / f"{dds_path.name}.json").write_text(json.dumps(sidecar, indent=2))
+        sidecar_path = meta / f"{dds_path.name}.json"
+        if not (SKIP_EXISTING and sidecar_path.exists()):
+            sidecar_path.write_text(json.dumps(sidecar, indent=2))
         return dds_path
 
 
@@ -641,6 +643,12 @@ class ModWalker:
 
     With `backup` on, an untouched `backup-<name>` copy of every yielded file is kept
     in the matching `out_dir` directory before the consumer sees it.
+
+    With `skip_existing` on, `out_dir` is read as the record of a previous walk: an
+    image already there under its own relative path is skipped (not extracted, not
+    yielded), a cooked tree is unpacked only when it is missing, and an existing
+    sidecar is kept. Interrupted walks resume with it; it is off by default, since a
+    consumer that writes its results elsewhere would see nothing skipped anyway.
 
     Lifetime: everything yielded is temporary. Extracted members and decoded textures
     land in the walk's scratch tree, and each is unlinked as the next file is yielded,
@@ -662,6 +670,7 @@ class ModWalker:
         out_dir: str | Path = OUT_DIR,
         selective: bool = False,
         backup: bool = BACKUP,
+        skip_existing: bool = SKIP_EXISTING,
     ) -> None:
         self.root = Path(mod_root).resolve()
         self.out = Path(out_dir).resolve()
@@ -669,10 +678,16 @@ class ModWalker:
         #: huge archive, at the cost of re-decoding a solid archive once per member.
         self.selective = selective
         self.backup = backup
+        #: Resume mode: anything already sitting in `out` under its yielded relative
+        #: path counts as done, and is neither redone nor delivered again.
+        self.skip_existing = skip_existing
         #: Relative paths already handed to the consumer, and container sets already
         #: unpacked, so nothing is extracted or delivered twice in one walk.
         self._seen: set[str] = set()
         self._done_containers: set[str] = set()
+        #: Files skipped as already present in `out`. Only read as a delta, to tell a
+        #: container that decoded nothing from one whose textures were all done before.
+        self._skipped = 0
         #: The scratch file last yielded, unlinked when the next one is delivered.
         #: Loose mod images are yielded in place and never enter this.
         self._live: Path | None = None
@@ -755,6 +770,11 @@ class ModWalker:
         """Unpack the container into its output bundle for write-back; returns the root."""
         log.info("container %s", prefix)
         cooked = self.out / prefix / COOKED_DIR
+        # A cooked tree only ever depends on the container it came from, so an existing
+        # one is the same tree retoc would write again; unpacking is the expensive half.
+        if self.skip_existing and cooked.is_dir() and any(cooked.rglob("*")):
+            log.info("%s: cooked tree already unpacked", prefix)
+            return cooked
         UEContainerSource(set_dir).extract([], cooked)
         return cooked
 
@@ -779,12 +799,15 @@ class ModWalker:
             drop(self.out / prefix / COOKED_DIR)
 
         delivered = 0
+        skipped = self._skipped
         try:
             for item in self._walk_assets(set_dir, prefix):
                 delivered += 1
                 yield item
         finally:
-            if not delivered:
+            # Skips count as deliveries here: a container whose textures were all done
+            # by an earlier walk has an output bundle worth keeping, not an empty one.
+            if not delivered and self._skipped == skipped:
                 log.info("%s: nothing decoded, dropping the output bundle", prefix)
                 shutil.rmtree(self.out / prefix, ignore_errors=True)
 
@@ -814,6 +837,10 @@ class ModWalker:
     ) -> Iterator[WalkItem]:
         """Extract and yield `members` into the output tree, selectively or in one batch."""
 
+        if self.skip_existing:
+            # Filtered before extraction, not at delivery: the point of resuming is to
+            # not pay for the member again, and py7zr charges per member asked for.
+            members = [m for m in members if not self._done(join_rel(prefix, m))]
         if not members:
             return
         dest = self.work / prefix
@@ -868,6 +895,16 @@ class ModWalker:
         seen.add(key)
         return True
 
+    def _done(self, rel: str) -> bool:
+        """True when `skip_existing` and `rel` is already in the output tree."""
+        # The real relative path, not the `backup-<name>` copy beside it: what counts
+        # as done is the image the consumer wrote back, not the untouched original.
+        if not self.skip_existing or not (self.out / rel).exists():
+            return False
+        log.info("skipping %s: already in the output", rel)
+        self._skipped += 1
+        return True
+
     def _deliver(self, path: Path | str, rel: str) -> Iterator[WalkItem]:
         """
         Back the file up if asked, retire the previous one, then hand it over.
@@ -875,7 +912,12 @@ class ModWalker:
         The backup mirrors `rel` under `out` and is the only copy that survives the
         walk: the file yielded is scratch, and is unlinked the moment the next one is
         delivered. Loose mod images are the exception, yielded in place and left alone.
+
+        Under `skip_existing` a file already in the output is dropped here rather than
+        yielded, so it is not backed up over either.
         """
+        if self._done(rel):
+            return
         if not self._claim(self._seen, rel, "file"):
             return
         path = Path(path)
@@ -912,9 +954,11 @@ class ModWalker:
             log.debug("traceback for %s", what, exc_info=True)
 
 
-def fileIterator(backup: bool = BACKUP) -> Iterator[WalkItem]:
+def fileIterator(
+    backup: bool = BACKUP, skip_existing: bool = SKIP_EXISTING
+) -> Iterator[WalkItem]:
     """Convenience wrapper over `ModWalker`; see it for semantics."""
-    return iter(ModWalker(MOD_ROOT, OUT_DIR, False, backup))
+    return iter(ModWalker(MOD_ROOT, OUT_DIR, False, backup, skip_existing))
 
 
 if __name__ == "__main__":
