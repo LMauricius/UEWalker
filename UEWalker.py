@@ -14,7 +14,10 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
+import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -105,6 +108,123 @@ def drop(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# Scratch lifetime
+# ---------------------------------------------------------------------------
+
+#: Every temp directory this module makes is `uewalker-<pid>-<random>`. The pid is
+#: what lets a later run tell a dead process's leftovers from a live walk's scratch.
+SCRATCH_PREFIX = "uewalker-"
+
+#: Scratch roots this process owns, dropped on exit or on a fatal signal.
+_scratch_roots: set[Path] = set()
+
+#: Handlers displaced by `scratch_guard`, keyed by signal, restored when it exits.
+_displaced: dict[int, object] = {}
+
+
+def scratch_dir() -> Path:
+    """New temp directory, tracked so it is removed even on an abrupt exit."""
+    path = Path(tempfile.mkdtemp(prefix=f"{SCRATCH_PREFIX}{os.getpid()}-"))
+    _scratch_roots.add(path)
+    return path
+
+
+def release_scratch(path: Path) -> None:
+    """Remove one tracked scratch directory now, and stop tracking it."""
+    _scratch_roots.discard(path)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _drop_scratch() -> None:
+    """Remove every scratch directory this process still owns. Runs on exit."""
+    for path in list(_scratch_roots):
+        release_scratch(path)
+
+
+# A walk's scratch runs to gigabytes, so an ordinary exit must never leave it behind:
+# normal returns, uncaught exceptions and `sys.exit` all pass through here.
+atexit.register(_drop_scratch)
+
+
+def _on_fatal_signal(signum: int, frame: object) -> None:
+    """Drop the scratch, then hand the signal on to the handler we displaced."""
+    _drop_scratch()
+    previous = _displaced.get(signum, signal.SIG_DFL)
+    if callable(previous):
+        previous(signum, frame)  # type: ignore[operator]
+        return
+    # Nothing was installed: put the default back and re-raise, so the process dies
+    # exactly as it would have (right exit status, right "killed by" report).
+    signal.signal(signum, previous)  # type: ignore[arg-type]
+    os.kill(os.getpid(), signum)
+
+
+@contextmanager
+def scratch_guard() -> Iterator[None]:
+    """
+    Clean up after fatal signals for as long as a walk is running.
+
+    SIGTERM and SIGHUP kill the process outright: no `atexit`, no `finally` in an
+    abandoned generator, so the scratch tree would survive the walk that made it.
+    SIGINT is deliberately left alone, since its default already raises
+    KeyboardInterrupt, which unwinds the walk normally and can even be caught and
+    the walk resumed. Handlers are installed only for the duration of the walk and
+    always chain to what was there before, so an embedding application keeps its own
+    shutdown behaviour. Signals can only be handled on the main thread; elsewhere
+    the walk simply runs unguarded, and the stale sweep is the backstop.
+    """
+    installed: list[int] = []
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        previous = signal.getsignal(sig)
+        # SIG_IGN means the host is deliberately deaf to this signal, and our own
+        # handler means an outer walk already guards it: in both cases, hands off.
+        if previous is signal.SIG_IGN or previous is _on_fatal_signal:
+            continue
+        try:
+            signal.signal(sig, _on_fatal_signal)
+        except ValueError:  # not the main thread
+            break
+        _displaced[sig] = previous
+        installed.append(sig)
+    try:
+        yield
+    finally:
+        for sig in installed:
+            signal.signal(sig, _displaced.pop(sig))  # type: ignore[arg-type]
+
+
+def sweep_stale_scratch() -> None:
+    """
+    Remove scratch left behind by a run that never got to clean up.
+
+    A SIGKILL, a power cut or a crash inside the CLR takes the process down with no
+    chance to run anything at all, so the tree is still there on the next run. The
+    owning pid is in the directory name: a dead owner makes the tree ours to remove,
+    a live one means a concurrent walk we must not touch. Liveness is a POSIX check,
+    so elsewhere the sweep does nothing rather than risk deleting live scratch.
+    """
+    if os.name != "posix":
+        return
+    for path in Path(tempfile.gettempdir()).glob(f"{SCRATCH_PREFIX}*-*"):
+        owner = path.name[len(SCRATCH_PREFIX) :].split("-", 1)[0]
+        if not owner.isdigit() or int(owner) == os.getpid():
+            continue
+        try:
+            os.kill(int(owner), 0)
+        except ProcessLookupError:
+            pass  # the owner is gone, so nothing can still be using this
+        except OSError:
+            continue  # alive, just not ours to signal
+        else:
+            continue  # alive: a concurrent walk's scratch
+        log.info("sweeping stale scratch %s", path)
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def join_rel(*parts: str) -> str:
     """Join relative path segments POSIX-style, dropping empty and `.` segments."""
     kept = [p.strip("/") for p in parts if p and p.strip("/") not in ("", ".")]
@@ -119,6 +239,26 @@ def archive_segment(relpath: str) -> str:
     """
     p = PurePosixPath(relpath)
     return join_rel(str(p.parent), p.name + "-extracted")
+
+
+#: `<base>_P`, `<base>_P2`, ... : UE's patch-container naming.
+PATCH_SUFFIX = re.compile(r"^(?P<base>.+)_P(?P<priority>\d*)$")
+
+
+def patch_family(stem: str) -> tuple[str, int]:
+    """
+    Split a container stem into its family name and patch priority.
+
+    UE names patch containers `<base>_P`, `<base>_P2`, ..., mounted over the base in
+    ascending order. They are one logical container: a payload in one belongs to
+    packages indexed in another, so a texture's optional (`.uptnl`) mip routinely
+    lives in a higher-numbered sibling. A stem with no patch suffix is a family of
+    its own at priority 0.
+    """
+    m = PATCH_SUFFIX.match(stem)
+    if m is None:
+        return stem, 0
+    return m["base"], int(m["priority"] or 1)
 
 
 def global_dir() -> str | None:
@@ -149,8 +289,7 @@ def global_dir() -> str | None:
 
     # Long-lived: every container mounts it, so it outlives any one walk rather than
     # being tied to a walk's scratch tree, and is dropped when the process ends.
-    holder = Path(tempfile.mkdtemp(prefix="uewalker-global-"))
-    atexit.register(shutil.rmtree, holder, ignore_errors=True)
+    holder = scratch_dir()
     for member in members:
         (holder / member.name).symlink_to(member)
     log.debug("global container mounted from %s", paks)
@@ -262,41 +401,52 @@ def dds_bytes(pixel_format: str, width: int, height: int, mips: list[bytes]) -> 
 @dataclass
 class UEContainerSet:
     """
-    A `.pak` / `.utoc` + `.ucas` group sharing one directory and stem.
+    A `.pak` / `.utoc` + `.ucas` group sharing one directory and patch family.
 
     UE containers only unpack as a set, so members are collected before extraction.
+    The whole `_P<n>` family counts as one set rather than one set per stem: a patch
+    container holds payload for packages indexed in its base, so mounting either half
+    alone leaves those payloads unreachable. Members of each extension are ordered by
+    ascending patch priority, which is the order UE mounts them in.
     """
 
     dirname: str
-    stem: str
-    members: dict[str, str] = field(default_factory=dict)  # ext -> archive-internal name
+    family: str
+    members: dict[str, list[str]] = field(default_factory=dict)  # ext -> internal names
 
     @property
-    def representative_ext(self) -> str:
-        """Extension used to name the `-extracted` segment for this set."""
+    def representative(self) -> str:
+        """Archive-internal name the `-extracted` segment is named after."""
         for e in UE_REPRESENTATIVE_ORDER:
             if e in self.members:
-                return e
-        raise RuntimeError(f"empty container set {self.dirname}/{self.stem}")
+                return self.members[e][0]
+        raise RuntimeError(f"empty container set {self.dirname}/{self.family}")
 
     @property
     def segment(self) -> str:
         """Relative segment this set contributes, e.g. `chars/skin.ucas-extracted`."""
-        return join_rel(self.dirname, f"{self.stem}{self.representative_ext}-extracted")
+        return archive_segment(self.representative)
 
     def internal_names(self) -> list[str]:
-        return sorted(self.members.values())
+        return sorted(n for names in self.members.values() for n in names)
 
 
 def group_ue_members(internals: Iterable[str]) -> list[UEContainerSet]:
-    """Group container member names into ordered `UEContainerSet`s by (directory, stem)."""
+    """Group container member names into ordered `UEContainerSet`s by (directory, family)."""
     groups: dict[tuple[str, str], UEContainerSet] = {}
     for internal in internals:
         p = PurePosixPath(internal)
         dirname = "" if str(p.parent) == "." else str(p.parent)
-        key = (dirname, p.stem)
-        group = groups.setdefault(key, UEContainerSet(dirname, p.stem))
-        group.members[ext_of(internal)] = internal
+        family, _ = patch_family(p.stem)
+        key = (dirname, family)
+        group = groups.setdefault(key, UEContainerSet(dirname, family))
+        group.members.setdefault(ext_of(internal), []).append(internal)
+
+    # Priority order, so the lowest-numbered member names the segment (keeping the
+    # relative path a plain mod would have had) and the highest is unpacked last.
+    for group in groups.values():
+        for names in group.members.values():
+            names.sort(key=lambda n: patch_family(PurePosixPath(n).stem)[1])
     return [groups[k] for k in sorted(groups)]
 
 
@@ -370,13 +520,22 @@ class UEContainerSource(ArchiveSource):
         raise NotImplementedError("UE containers cannot be listed without unpacking")
 
     def extract(self, members: list[str], dest: Path) -> None:
-        """`members` is ignored: the whole container is converted/unpacked into `dest`."""
+        """`members` is ignored: the whole container set is converted/unpacked into `dest`."""
         dest.mkdir(parents=True, exist_ok=True)
 
         # retoc reads the .ucas alongside its .utoc, so only the index file is named.
-        utoc = next(self.set_dir.rglob("*.utoc"), None)
-        if utoc is not None:
-            self._from_iostore(utoc, dest)
+        # A patch family is several containers unpacked into one tree, in ascending
+        # priority so a patched package overwrites the one it replaces. One of them
+        # yielding nothing is normal (a patch carrying only optional mips has no
+        # packages of its own), so the set fails only when none of them yielded.
+        utocs = sorted(
+            self.set_dir.rglob("*.utoc"), key=lambda p: patch_family(p.stem)[1]
+        )
+        if utocs:
+            for utoc in utocs:
+                self._from_iostore(utoc, dest)
+            if not any(dest.rglob("*.uasset")):
+                raise RuntimeError(f"retoc unpacked no packages from {self.set_dir}")
             return
 
         # No .utoc: the set is already legacy, and retoc speaks IoStore only.
@@ -401,10 +560,14 @@ class UEContainerSource(ArchiveSource):
         survives in those containers, at the cost of emitting Zen-format assets.
         """
         aes = ["-a", AES_KEY] if AES_KEY else []
+        # `dest` may already hold packages from an earlier container of the same patch
+        # family, so "did to-legacy write anything?" has to be asked as "did the set of
+        # packages grow?" rather than "is the tree non-empty?".
+        before = set(dest.rglob("*.uasset"))
         # -a is a global option and must precede the subcommand.
         run_tool([RETOC_PATH, *aes, "to-legacy", "--version", RETOC_VERSION,
                   str(utoc), str(dest)])
-        if any(dest.rglob("*.uasset")):
+        if set(dest.rglob("*.uasset")) != before:
             return
 
         log.info(
@@ -558,8 +721,9 @@ class TextureDecoder:
         log.debug("decoding package %s", pkg_path)
         package = self.provider.LoadPackage(pkg_path)
 
-        dest.mkdir(parents=True, exist_ok=True)
-        meta.mkdir(parents=True, exist_ok=True)
+        # The two directories are created by `_write_texture`, not here: a package that
+        # decodes nothing (no texture export, or no reachable mip) must not leave an
+        # empty `-extracted` directory behind in the output tree.
         written: list[Path] = []
         for export in package.GetExports():
             mips = self._mips_of(export)
@@ -589,8 +753,27 @@ class TextureDecoder:
             raise RuntimeError(f"unsupported pixel format {pixel_format} in {pkg_path}")
 
         # Marshal each mip out of .NET once; bytes(...) copies the managed array.
-        payloads = [bytes(mip.BulkData.Data) for mip in mips]
-        top = mips[0]
+        # A mip can parse yet carry no payload: an optional (`.uptnl`) or streamed one
+        # lives in a chunk that this mount does not have, and reads back as null. Only
+        # that mip is dropped, never the texture, and the sidecar keeps every surviving
+        # mip's own dimensions, so a gap in the chain cannot misalign the write-back.
+        kept, payloads = [], []
+        for mip in mips:
+            data = mip.BulkData.Data
+            if data is None:
+                log.warning(
+                    "%s: %dx%d mip of %s has no payload here (%s), skipped",
+                    pkg_path, mip.SizeX, mip.SizeY, export.Name, mip.BulkData.BulkDataFlags,
+                )
+                continue
+            kept.append(mip)
+            payloads.append(bytes(data))
+        if not payloads:
+            raise RuntimeError(f"no mip payload reachable for {export.Name} in {pkg_path}")
+
+        mips, top = kept, kept[0]
+        dest.mkdir(parents=True, exist_ok=True)
+        meta.mkdir(parents=True, exist_ok=True)
         dds_path = dest / f"{export.Name}.dds"
         log.debug(
             "texture %s (%s %dx%d, %d mips)",
@@ -661,6 +844,11 @@ class ModWalker:
     splices into. Loose images already on disk are yielded in place and never copied or
     unlinked, so consumers edit the real mod file.
 
+    The scratch tree is released when the walk ends, however it ends: exhausted,
+    closed, abandoned, killed by SIGTERM, or left behind by a process that crashed
+    outright (the next walk sweeps that one). `close` releases it on demand, and the
+    walker doubles as a context manager.
+
     Errors from a single archive, container or asset are logged and skipped.
     """
 
@@ -691,6 +879,8 @@ class ModWalker:
         #: The scratch file last yielded, unlinked when the next one is delivered.
         #: Loose mod images are yielded in place and never enter this.
         self._live: Path | None = None
+        #: This walk's scratch tree, live only while iterating. See `close`.
+        self.tmp_root: Path | None = None
 
     # -- public API ---------------------------------------------------------
 
@@ -698,12 +888,39 @@ class ModWalker:
         require_tools()
         log.info("walking mod root %s -> %s", self.root, self.out)
         self.out.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="modextract_") as tmp:
-            self.tmp_root = Path(tmp)
+        # Anything a previous run died holding is dead weight now: reclaim the disk
+        # before this walk starts filling it again.
+        sweep_stale_scratch()
+        with scratch_guard():
+            self.tmp_root = scratch_dir()
             #: Everything handed to the consumer, mirroring the yielded relative path.
             self.work = self.tmp_root / "delivered"
             self._live = None
-            yield from self._walk_disk()
+            try:
+                yield from self._walk_disk()
+            finally:
+                self.close()
+
+    def close(self) -> None:
+        """
+        Drop this walk's scratch tree now.
+
+        The walk does this for itself when it ends, is exhausted or is closed, and
+        `atexit` and `scratch_guard` cover the paths where none of that happens. This
+        is for a consumer that abandons the iterator and would rather not wait for the
+        garbage collector to notice. Calling it mid-walk pulls the tree out from under
+        the iteration; do not then ask for another file.
+        """
+        if self.tmp_root is not None:
+            self._live = None
+            release_scratch(self.tmp_root)
+            self.tmp_root = None
+
+    def __enter__(self) -> ModWalker:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     # -- layer 1: the mod folder on disk -------------------------------------
 
