@@ -727,19 +727,39 @@ class TextureDecoder:
         `.uasset` plus `.ubulk`, no `.uexp`), which is what `retoc unpack` would have
         produced from the whole container -- one package at a time, and without
         unpacking or re-extracting anything.
+
+        Every chunk is written beside the package's own `.uasset`, under the package path
+        `key` gives, rather than at whatever path the provider returned for it. UE resolves
+        a payload as a sibling of the asset that references it, so siblings they have to
+        be, and the returned paths do not always agree: `SavePackage` keys the `.uasset`
+        and `.ubulk` off the provider index but finds an optional (`.uptnl`) payload
+        through the owning container's own index instead, which is mounted somewhere else
+        entirely. Trusting that key drops the `.uptnl` at the root of `_cooked`, where
+        nothing reading the package can find it.
         """
+
         ok, data = self.provider.TrySavePackage(key)
         if not ok:
             raise RuntimeError(f"no cooked payload for {key}")
 
+        # The package path is the anchor, and it is the one path here that is known to
+        # address the package: it is what the caller looked the package up by.
+        package = PurePosixPath(to_posix(key))
+        if package.is_absolute() or ".." in package.parts:
+            raise RuntimeError(f"unsafe package path {key!r}")
+
         written: list[Path] = []
         for name in data.Keys:
-            # Package paths come from the provider index and address the mount, but
-            # they end up joined onto a durable directory: anything that could climb
-            # out of it is refused rather than trusted.
-            rel = PurePosixPath(to_posix(str(name)))
-            if rel.is_absolute() or ".." in rel.parts:
-                raise RuntimeError(f"unsafe package path {name!r} in {key}")
+            # Only the file name is taken from the chunk's own path, so several payloads
+            # of one package stay distinct; the directory always comes from the package.
+            # A name is still a name and ends up joined onto a durable directory, so
+            # anything that could climb out of it is refused rather than trusted.
+            chunk = PurePosixPath(to_posix(str(name))).name
+            if not chunk or chunk in (".", "..") or "/" in chunk:
+                raise RuntimeError(f"unsafe payload name {name!r} in {key}")
+            if not chunk.startswith(package.stem):
+                log.warning("%s: payload %s does not belong to this package", key, name)
+            rel = package.parent / chunk
             path = root / rel
             if self.skip_existing and path.is_file():
                 log.debug("cooked %s already saved", rel)

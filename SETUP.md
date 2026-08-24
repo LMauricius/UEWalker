@@ -199,14 +199,18 @@ misreads this game's container header and silently writes a container that decla
 packages at all. `patches/` holds the two diffs and `TOOL-PATCHES.md` explains each change.
 
 ```bash
-git clone --recurse-submodules --shallow-submodules --depth 1 \
-  https://github.com/rm-NoobInCoding/UnrealReZen.git /tmp/UnrealReZen
+git clone https://github.com/rm-NoobInCoding/UnrealReZen.git /tmp/UnrealReZen
 cd /tmp/UnrealReZen
+git checkout bf9e8de4abb63b80267f3895bbb83e8b86f53df5     # what the patches are cut against
+git submodule update --init --depth 1 --recursive external/CUE4Parse
 git apply /path/to/UEWalker/patches/unrealrezen.patch
 git -C external/CUE4Parse apply /path/to/UEWalker/patches/cue4parse.patch
 dotnet publish UnrealReZen/UnrealReZen.csproj -c Release -r linux-x64 \
   --self-contained false -o ~/Programs/Mo/UnrealReZen
 ```
+
+Pin the commit. The patches touch four files in UnrealReZen and one in CUE4Parse, and a
+later upstream change to any of them makes `git apply` fail.
 
 It fetches its own zlib-ng on first run and writes it beside the executable, so the
 output directory has to stay writable.

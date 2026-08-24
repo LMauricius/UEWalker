@@ -150,12 +150,14 @@ def cooked_parts(asset: Path, cooked: Path) -> dict[str, Path]:
     """
     Every chunk file of one cooked package, keyed by extension.
 
-    Normally they sit together, but an optional-mip (`.uptnl`) chunk comes back from
-    `TrySavePackage` without its directory prefix, so `save_package` drops it at the root
-    of `_cooked` instead of beside its own package. UE4-DDS-Tools resolves the chunks as
-    siblings of the `.uasset` and fails outright when one is missing, so a stray is looked
-    up by name and reported here for the caller to stage.
+    They sit together in anything `save_package` writes now, but output from before it
+    anchored every chunk on the package path can have an optional-mip (`.uptnl`) chunk at
+    the root of `_cooked` instead of beside its own package. UE4-DDS-Tools resolves the
+    chunks as siblings of the `.uasset` and fails outright when one is missing, so a stray
+    is looked up by name and reported here for the caller to stage. Re-walking a mod just
+    to move those is not worth it, so this stays.
     """
+
     parts = {".uasset": asset}
     for ext in (".ubulk", ".uptnl"):
         sibling = asset.with_suffix(ext)

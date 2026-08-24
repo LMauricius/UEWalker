@@ -1,0 +1,41 @@
+diff --git a/CUE4Parse/UE4/IO/Objects/FFilePackageStoreEntry.cs b/CUE4Parse/UE4/IO/Objects/FFilePackageStoreEntry.cs
+index c1e93e7..baf9cc9 100644
+--- a/CUE4Parse/UE4/IO/Objects/FFilePackageStoreEntry.cs
++++ b/CUE4Parse/UE4/IO/Objects/FFilePackageStoreEntry.cs
+@@ -9,6 +9,7 @@ public class FFilePackageStoreEntry
+     {
+         public int ExportCount;
+         public int ExportBundleCount;
++        public uint LoadOrder;
+         public FPackageId[] ImportedPackages;
+         public FSHAHash[] ShaderMapHashes;
+ 
+@@ -30,8 +31,12 @@ public FFilePackageStoreEntry(FArchive Ar, EIoContainerHeaderVersion version)
+                 Ar.Position += 8; // ExportBundlesSize
+                 ExportCount = Ar.Read<int>();
+                 ExportBundleCount = Ar.Read<int>();
+-                Ar.Position += 8; // LoadOrder + Pad
++                LoadOrder = Ar.Read<uint>();
++                Ar.Position += 4; // Pad
+                 ImportedPackages = ReadCArrayView<FPackageId>(Ar);
++                // The pre-UE5 entry has no shader map hashes; leaving the field null makes
++                // every consumer that enumerates it throw instead of seeing an empty list.
++                ShaderMapHashes = Array.Empty<FSHAHash>();
+             }
+         }
+ 
+diff --git a/CUE4Parse/UE4/IO/Objects/FIoContainerHeader.cs b/CUE4Parse/UE4/IO/Objects/FIoContainerHeader.cs
+index 34357a8..0dbd222 100644
+--- a/CUE4Parse/UE4/IO/Objects/FIoContainerHeader.cs
++++ b/CUE4Parse/UE4/IO/Objects/FIoContainerHeader.cs
+@@ -92,6 +92,10 @@ public FIoContainerHeader(FArchive Ar)
+             var packageCount = Version < EIoContainerHeaderVersion.OptionalSegmentPackages ? Ar.Read<uint>() : 0;
+             if (Version == EIoContainerHeaderVersion.BeforeVersionWasAdded)
+             {
++                // FF7 Rebirth's engine fork writes an extra count here, between PackageCount
++                // and the name arrays. Without skipping it every following field is read four
++                // bytes early and the parse dies, which the UE4 branch below swallows silently.
++                if (Ar.Game == EGame.GAME_FinalFantasy7Rebirth) Ar.Position += 4;
+                 var namesSize = Ar.Read<int>();
+                 var namesPos = Ar.Position;
+                 var nameHashesSize = Ar.Read<int>();

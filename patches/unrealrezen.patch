@@ -1,0 +1,166 @@
+diff --git a/UnrealReZen/Core/FIoDependency.cs b/UnrealReZen/Core/FIoDependency.cs
+index a6bf9e2..060861a 100644
+--- a/UnrealReZen/Core/FIoDependency.cs
++++ b/UnrealReZen/Core/FIoDependency.cs
+@@ -8,6 +8,7 @@ namespace UnrealReZen.Core
+     {
+         public ulong ThisPackageID { get; set; }
+         public required Dictionary<ulong, FFilePackageStoreEntry> ChunkIDToDependencies { get; set; }
++        public Dictionary<ulong, ulong> ExportBundleSizes { get; set; } = [];
+     }
+ 
+     public class ManifestFile
+@@ -22,12 +23,13 @@ namespace UnrealReZen.Core
+         public required List<ManifestFile> Files { get; set; }
+ 
+         public required DependenciesData Deps { get; set; }
+-        public byte[] WriteDependenciesAsUE4()
++        public byte[] WriteDependenciesAsUE4(FIoDependencyFormat format = FIoDependencyFormat.UE4)
+         {
+             using var ms = new MemoryStream();
+ 
+             var hdr = new DepsHeader_UE4
+             {
++                Format = format,
+                 ThisPackageID = Deps.ThisPackageID,
+                 NumberOfIDs = (ulong)Deps.ChunkIDToDependencies.Count,
+                 IDSize = 8,
+@@ -63,12 +65,14 @@ namespace UnrealReZen.Core
+                 var entry = Deps.ChunkIDToDependencies[id];
+                 var link = new DepLinks_UE4
+                 {
+-                    FileSize = 0,
++                    // Size of the export bundle chunk actually being written, and the source
++                    // package's load order with the 0xFFFFFFFF pad the engine writes after it.
++                    FileSize = Deps.ExportBundleSizes.TryGetValue(id, out var bundleSize) ? bundleSize : 0,
+                     ExportCount = entry.ExportCount,
+                     ExportBundleCount = entry.ExportBundleCount,
+                     ImportedPackages = entry.ImportedPackages.Select(a => a.id).ToList(),
+                     ShaderMapHashes = entry.ShaderMapHashes.Select(a => a.Hash).ToList(),
+-                    SomeIndex = 0,
++                    SomeIndex = entry.LoadOrder | 0xFFFFFFFF00000000ul,
+                     DependencyPackages = entry.ImportedPackages.Length,
+                     Offset = 0
+                 };
+@@ -156,6 +160,7 @@ namespace UnrealReZen.Core
+ 
+     public class DepsHeader_UE4
+     {
++        public FIoDependencyFormat Format { get; set; } = FIoDependencyFormat.UE4;
+         public EIoContainerHeaderVersion Version { get; set; }
+         public ulong ThisPackageID { get; set; }
+         public ulong NumberOfIDs { get; set; }
+@@ -168,6 +173,9 @@ namespace UnrealReZen.Core
+         {
+             ms.Write(ThisPackageID);
+             ms.Write(NumberOfIDs);
++            // FF7 Rebirth keeps a separate (always empty here) name array ahead of the name
++            // hashes, so its header carries one more count than the stock UE4 layout.
++            if (Format == FIoDependencyFormat.UE4_FF7Rebirth) ms.Write(0u);
+             ms.Write(IDSize);
+             ms.Write(Padding);
+             ms.Write(ZeroBytes);
+diff --git a/UnrealReZen/Core/FIoEnums.cs b/UnrealReZen/Core/FIoEnums.cs
+index 2452784..b3fe1e5 100644
+--- a/UnrealReZen/Core/FIoEnums.cs
++++ b/UnrealReZen/Core/FIoEnums.cs
+@@ -12,6 +12,7 @@
+     public enum FIoDependencyFormat
+     {
+         UE4,
++        UE4_FF7Rebirth,
+         UE5
+     }
+ 
+diff --git a/UnrealReZen/Core/FIoPack.cs b/UnrealReZen/Core/FIoPack.cs
+index 9832c26..053e7f2 100644
+--- a/UnrealReZen/Core/FIoPack.cs
++++ b/UnrealReZen/Core/FIoPack.cs
+@@ -14,7 +14,9 @@ namespace UnrealReZen.Core
+     {
+         public static int PackToCasToc(string dir, Dependency m, string outFilename, string compression, FAesKey? outputAes, string mountPoint, EGame gameVer)
+         {
+-            FIoDependencyFormat depver = gameVer >= EGame.GAME_UE5_0 ? FIoDependencyFormat.UE5 : FIoDependencyFormat.UE4;
++            FIoDependencyFormat depver = gameVer >= EGame.GAME_UE5_0 ? FIoDependencyFormat.UE5
++                : gameVer == EGame.GAME_FinalFantasy7Rebirth ? FIoDependencyFormat.UE4_FF7Rebirth
++                : FIoDependencyFormat.UE4;
+ 
+             var fdata = new List<AssetMetadata>();
+             AssetMetadata newEntry;
+@@ -147,7 +149,7 @@ namespace UnrealReZen.Core
+             {
+                 throw new FileNotFoundException($"Content file not found: {entry.FilePath}");
+             }
+-            byte[] depBytes = depver == FIoDependencyFormat.UE4 ? m.WriteDependenciesAsUE4() : m.WriteDependenciesAsUE5();
++            byte[] depBytes = depver == FIoDependencyFormat.UE5 ? m.WriteDependenciesAsUE5() : m.WriteDependenciesAsUE4(depver);
+             entry.FilePath = "";
+             return ChunkSource.FromBytes(depBytes);
+         }
+diff --git a/UnrealReZen/Program.cs b/UnrealReZen/Program.cs
+index 0cae02d..8699525 100644
+--- a/UnrealReZen/Program.cs
++++ b/UnrealReZen/Program.cs
+@@ -1,4 +1,4 @@
+-using CommandLine;
++﻿using CommandLine;
+ using CommandLine.Text;
+ using CUE4Parse.Compression;
+ using CUE4Parse.Encryption.Aes;
+@@ -189,7 +189,14 @@ namespace UnrealReZen
+                 provider = new DefaultFileProvider(opts.GameDirectory, searchOption, new VersionContainer(engineVersion), StringComparer.OrdinalIgnoreCase);
+                 provider.Initialize();
+                 provider.SubmitKey(new FGuid(), aesKey);
+-                provider.LoadLocalization(ELanguage.English);
++                try
++                {
++                    provider.LoadLocalization(ELanguage.English);
++                }
++                catch (Exception ex)
++                {
++                    Log.Debug("No localization in the game directory ({Message}); continuing.", ex.Message);
++                }
+ 
+                 if (provider.RequiredKeys.Count > 0 && provider.Keys.Count == 0)
+                 {
+@@ -213,6 +220,9 @@ namespace UnrealReZen
+             byte containerChunkType = engineVersion >= EGame.GAME_UE5_0
+                 ? (byte)EIoChunkType5.ContainerHeader
+                 : (byte)EIoChunkType.ContainerHeader;
++            byte exportBundleChunkType = engineVersion >= EGame.GAME_UE5_0
++                ? (byte)EIoChunkType5.ExportBundleData
++                : (byte)EIoChunkType.ExportBundleData;
+ 
+             var manifest = new Dependency
+             {
+@@ -242,6 +252,12 @@ namespace UnrealReZen
+                 foreach (var entry in matches)
+                 {
+                     var chunkId = entry.ChunkId;
++                    // The store entry is copied from the source container and describes the
++                    // chunk that was there, so the size has to come from the file being packed.
++                    if (chunkId.ChunkType == exportBundleChunkType)
++                    {
++                        manifest.Deps.ExportBundleSizes[chunkId.ChunkId] = (ulong)new FileInfo(file).Length;
++                    }
+                     manifest.Files.Add(new ManifestFile
+                     {
+                         Filepath = entry.Path,
+@@ -251,9 +267,16 @@ namespace UnrealReZen
+                     var header = entry.IoStoreReader.ContainerHeader;
+                     if (header != null)
+                     {
+-                        foreach (var storeEntry in header.StoreEntries)
++                        // PackageIds and StoreEntries are parallel arrays: the entry for this
++                        // package is the one at its own index, not the container's first.
++                        var packageIndex = Array.FindIndex(header.PackageIds, id => id.id == chunkId.ChunkId);
++                        if (packageIndex >= 0 && packageIndex < header.StoreEntries.Length)
++                        {
++                            manifest.Deps.ChunkIDToDependencies.TryAdd(chunkId.ChunkId, header.StoreEntries[packageIndex]);
++                        }
++                        else
+                         {
+-                            manifest.Deps.ChunkIDToDependencies.TryAdd(chunkId.ChunkId, storeEntry);
++                            Log.Warning("No store entry for " + filename + "; the container header does not index it.");
+                         }
+                     }
+                 }
