@@ -220,18 +220,18 @@ output directory has to stay writable.
 Edit `UEWalkerConfig.py`:
 
 ```python
-SOURCE_ROOT_DIR      = "/path/to/mod"
-EDIT_ROOT_DIR       = "/path/to/output"
-RETOC_PATH    = "retoc"                                   # or an absolute path
-REPAK_PATH    = "repak"
-CUE4PARSE_DLL = "/home/you/Programs/CUE4Parse/CUE4Parse.dll"   # a publish output; `~` is not expanded
-GAME_PAK_DIR     = "/path/to/game/End/Content/Paks"          # read only for global.utoc/.ucas
-BACKUP        = False                                     # True keeps a backup- copy of each edit
-SKIP_EXISTING = True                                      # resume: skip what EDIT_ROOT_DIR already holds
-OODLE_LIB     = None                                      # None = let CUE4Parse fetch it
-AES_KEY       = None                                      # mod containers are normally plain
-RETOC_VERSION = "UE4_26"
-UE_VERSION    = "GAME_UE4_26"
+SOURCE_ROOT_DIR = "/path/to/mod"
+EDIT_ROOT_DIR   = "/path/to/output"
+RETOC_PATH      = "retoc"                                   # or an absolute path
+REPAK_PATH      = "repak"
+CUE4PARSE_DLL   = "/home/you/Programs/CUE4Parse/CUE4Parse.dll"   # a publish output; `~` is not expanded
+GAME_PAK_DIR    = "/path/to/game/End/Content/Paks"          # read only for global.utoc/.ucas
+BACKUP          = False                                     # True keeps a backup- copy of each edit
+SKIP_EXISTING   = True                                      # resume: skip what EDIT_ROOT_DIR already holds
+OODLE_LIB       = None                                      # None = let CUE4Parse fetch it
+AES_KEY         = None                                      # mod containers are normally plain
+RETOC_VERSION   = "UE4_26"
+UE_VERSION      = "GAME_UE4_26"
 DOTNET_RUNTIME_CONFIG = "/home/you/Programs/CUE4Parse/cue4parse-fetch.runtimeconfig.json"
 ```
 

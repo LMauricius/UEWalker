@@ -405,9 +405,9 @@ class ModRepacker:
     """
     Turns an edited output tree into patch containers, mirroring its structure.
 
-    `out_dir` is read, never written. Everything produced lands under `patch_dir` at the
-    relative path its source held, so a container that sat in `clothes/` comes out in
-    `clothes/`, and the loose files beside it come out beside it.
+    `edit_root_dir` is read, never written. Everything produced lands under
+    `patch_root_dir` at the relative path its source held, so a container that sat in
+    `clothes/` comes out in `clothes/`, and the loose files beside it come out beside it.
 
     Scratch goes through the walker's own registry, so an interrupted run leaves nothing
     behind: the injected assets for one container are written, packed and dropped before
@@ -421,18 +421,19 @@ class ModRepacker:
 
     def __init__(
         self,
-        out_dir: str | Path = EDIT_ROOT_DIR,
-        patch_dir: str | Path = PATCH_ROOT_DIR,
-        game_paks: str | None = None,
+        edit_root_dir: str | Path = EDIT_ROOT_DIR,
+        patch_root_dir: str | Path = PATCH_ROOT_DIR,
+        game_pak_dir: str | None = None,
         skip_existing: bool = SKIP_EXISTING,
         verify: bool = True,
         only: str | None = None,
     ) -> None:
-        self.out = Path(out_dir).resolve()
-        self.patch = Path(patch_dir).resolve()
-        self.paks = game_paks or REZEN_GAME_DIR or GAME_PAK_DIR
-        #: Restrict the run to one subtree, given relative to `out_dir`. Both roots stay
-        #: where they are, so the mirrored layout and the cached index are unaffected.
+        self.out = Path(edit_root_dir).resolve()
+        self.patch = Path(patch_root_dir).resolve()
+        self.paks = game_pak_dir or REZEN_GAME_DIR or GAME_PAK_DIR
+        #: Restrict the run to one subtree, given relative to `edit_root_dir`. Both
+        #: roots stay where they are, so the mirrored layout and the cached index are
+        #: unaffected.
         #: A walk still in progress is the usual reason: only the part it has finished
         #: with can safely be packed.
         self.only = PurePosixPath(only) if only else None
@@ -812,12 +813,12 @@ class ModRepacker:
 
 
 def repack(
-    out_dir: str | Path = EDIT_ROOT_DIR,
-    patch_dir: str | Path = PATCH_ROOT_DIR,
+    edit_root_dir: str | Path = EDIT_ROOT_DIR,
+    patch_root_dir: str | Path = PATCH_ROOT_DIR,
     only: str | None = None,
 ) -> int:
     """Convenience wrapper over `ModRepacker`; see it for semantics."""
-    return ModRepacker(out_dir, patch_dir, only=only).run()
+    return ModRepacker(edit_root_dir, patch_root_dir, only=only).run()
 
 
 if __name__ == "__main__":

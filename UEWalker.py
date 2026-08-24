@@ -893,7 +893,7 @@ class ModWalker:
     `<name><ext>-extracted` segment, and a cooked asset adds one too, so a nested
     texture reads as `abc.7z-extracted/def.utoc-extracted/Game/Foo.uasset-extracted/Foo.dds`.
 
-    The consumer owns `out_dir`: it writes its edited version of a yielded file there,
+    The consumer owns `edit_root_dir`: it writes its edited version of a yielded file there,
     under the same relative path and the same name, before asking for the next file.
     The walker follows behind it. Every texture gets its `.dds.json` sidecar, and a
     container handed over whole gets a `.uewalker-done` marker; beyond that, only an
@@ -902,7 +902,7 @@ class ModWalker:
     untouched original is kept beside the edit as `backup-<name>`. An unedited texture
     costs nothing but its sidecar.
 
-    With `skip_existing` on, `out_dir` is read back as the record of previous walks.
+    With `skip_existing` on, `edit_root_dir` is read back as the record of previous walks.
     A container whose marker is there is skipped before its payload leaves the
     archive; inside one that was interrupted, a file already sitting under its own
     relative path is skipped too, so its texture is never decoded and its member never
@@ -927,14 +927,14 @@ class ModWalker:
 
     def __init__(
         self,
-        mod_root: str | Path = SOURCE_ROOT_DIR,
-        out_dir: str | Path = EDIT_ROOT_DIR,
+        source_root_dir: str | Path = SOURCE_ROOT_DIR,
+        edit_root_dir: str | Path = EDIT_ROOT_DIR,
         selective: bool = False,
         backup: bool = BACKUP,
         skip_existing: bool = SKIP_EXISTING,
     ) -> None:
-        self.root = Path(mod_root).resolve()
-        self.out = Path(out_dir).resolve()
+        self.root = Path(source_root_dir).resolve()
+        self.out = Path(edit_root_dir).resolve()
         #: One extract call per member instead of one per group. Bounds peak disk on a
         #: huge archive, at the cost of re-decoding a solid archive once per member.
         self.selective = selective
