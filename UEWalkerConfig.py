@@ -12,9 +12,37 @@ MOD_ROOT = "/path/to/mod"
 #: the cooked package it came from, under `<container>/_cooked`.
 OUT_DIR = "/path/to/output"
 
-#: IoStore container packer. The walk never runs it, since containers are read
-#: through CUE4Parse; it is the later patch pass that needs it, to build a `_P`
-#: container out of the edited assets and `_cooked` payloads in `OUT_DIR`.
+#: Output for the patch files to be used for the new mod
+PATCH_DIR = "/path/to/result"
+
+#: UE4-DDS-Tools `src` directory, imported by the repacker to write an edited `.dds`
+#: back into the cooked Zen asset it came from. It rewrites the texture's dimensions,
+#: mip count and bulk descriptors, which is what a downscaled edit needs. Pure Python
+#: and MIT licensed; the bundled `texconv` library is never reached, since it is only
+#: loaded for sources that are not already `.dds`.
+#: https://github.com/matyalatte/UE4-DDS-Tools
+UE4_DDS_TOOLS = "UE4-DDS-Tools/src"
+
+#: UnrealReZen, which packs the edited assets into a `.utoc`/`.ucas`/`.pak` triplet.
+#: Must be the locally patched build: stock UnrealReZen and the CUE4Parse it bundles
+#: both misread this game's container header and silently emit a container that
+#: declares no packages. `TOOL-PATCHES.md` lists every change and why.
+#: https://github.com/rm-NoobInCoding/UnrealReZen
+UNREALREZEN_PATH = "UnrealReZen/UnrealReZen"
+
+#: Container the repacker reads chunk IDs and package store entries out of. Only the
+#: `.utoc` directory indexes and one header chunk per container are touched, never the
+#: `.ucas` payload, so pointing this at the whole game costs seconds rather than the
+#: 150 GB the folder holds. None falls back to `GAME_PAKS`.
+REZEN_GAME_DIR: str | None = None
+
+#: Compression for the packed container: None, Zlib, Oodle, or LZ4. `None` keeps the
+#: output readable and the packer dependency-free; Oodle matches what the game ships.
+PATCH_COMPRESSION = "None"
+
+#: IoStore inspector. Useful for looking at a container, but it cannot pack for this
+#: game: it misreads the same header field UnrealReZen did, which is why `to-legacy`
+#: reports `packages: 0` and writes nothing.
 #: Prebuilt Linux binaries: https://github.com/trumank/retoc/releases
 RETOC_PATH = "retoc"
 
@@ -55,6 +83,14 @@ OODLE_LIB: str | None = None
 #: it differently: retoc takes `UE4_26`, CUE4Parse takes the `EGame` member name.
 RETOC_VERSION = "UE4_26"
 UE_VERSION = "GAME_UE4_26"
+
+#: Engine version handed to UE4-DDS-Tools, which spells it differently again.
+DDS_TOOLS_VERSION = "4.26"
+
+#: Engine version handed to UnrealReZen. Unlike the walker, the packer needs the
+#: game-specific member: the container header layout differs from stock UE4.26, and
+#: the patched CUE4Parse keys its fix off this value.
+REZEN_VERSION = "GAME_FinalFantasy7Rebirth"
 
 UEWALKER_DEBUG = True
 

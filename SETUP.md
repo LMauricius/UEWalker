@@ -6,15 +6,26 @@ manager lines.
 
 Four pieces are involved, though only three of them are needed to walk a mod.
 
-| Dependency                              | Why                                                                                          | Source                                                                                                                                        |
-| --------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `py7zr`                                 | unpacks the mod's `.7z` archives                                                             | `pip install py7zr` ([PyPI](https://pypi.org/project/py7zr/))                                                                                 |
-| .NET 10 + `pythonnet` + `CUE4Parse.dll` | mounts UE containers and hands the raw mips of a cooked `Texture2D` to Python                | the [CUE4Parse](https://www.nuget.org/packages/CUE4Parse) NuGet package ([source](https://github.com/FabianFG/CUE4Parse))                     |
-| Oodle                                   | decompresses UE 4.26 container data on CUE4Parse's behalf                                    |                                                                                                                                               |
-| `retoc`                                 | packs edited assets into an IoStore patch container, in a later pass; the walk never runs it | [github.com/trumank/retoc](https://github.com/trumank/retoc) ([releases](https://github.com/trumank/retoc/releases), prebuilt Linux binaries) |
+| Dependency                              | Why                                                                                   | Source                                                                                                                                        |
+| --------------------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `py7zr`                                 | unpacks the mod's `.7z` archives                                                      | `pip install py7zr` ([PyPI](https://pypi.org/project/py7zr/))                                                                                 |
+| .NET 10 + `pythonnet` + `CUE4Parse.dll` | mounts UE containers and hands the raw mips of a cooked `Texture2D` to Python         | the [CUE4Parse](https://www.nuget.org/packages/CUE4Parse) NuGet package ([source](https://github.com/FabianFG/CUE4Parse))                     |
+| Oodle                                   | decompresses UE 4.26 container data on CUE4Parse's behalf                             |                                                                                                                                               |
+| `retoc`                                 | inspects containers; used by the repacker only to read a header back for verification | [github.com/trumank/retoc](https://github.com/trumank/retoc) ([releases](https://github.com/trumank/retoc/releases), prebuilt Linux binaries) |
 
-`repak` is a fifth, optional piece, and it belongs to that same later pass: it is needed
-only if a mod ships a legacy `.pak` with no `.utoc` beside it, which retoc cannot write.
+`UERePacker.py` adds two more, and needs neither of them to walk a mod:
+
+| Dependency    | Why                                                                            | Source                                                                                   |
+| ------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| UE4-DDS-Tools | writes an edited `.dds` back into its cooked Zen asset, resizing the mip chain | [github.com/matyalatte/UE4-DDS-Tools](https://github.com/matyalatte/UE4-DDS-Tools)       |
+| UnrealReZen   | packs the result into a `.utoc` / `.ucas` / `.pak` triplet                     | [github.com/rm-NoobInCoding/UnrealReZen](https://github.com/rm-NoobInCoding/UnrealReZen) |
+
+`repak` is optional and belongs to neither: it is needed only if a mod ships a legacy
+`.pak` with no `.utoc` beside it, which retoc cannot write.
+
+Note that retoc cannot pack for this game. Its `to-legacy` reports `packages: 0` and
+writes nothing at all, even on the game's own containers, because it misreads a field in
+the container header. `TOOL-PATCHES.md` covers that in full.
 
 ## What actually gets unpacked
 
@@ -170,7 +181,37 @@ curl -sSL https://github.com/trumank/repak/releases/latest/download/repak_cli-x8
 install /tmp/repak_cli-x86_64-unknown-linux-gnu/repak ~/.local/bin/
 ```
 
-## 8. Point the script at everything
+## 8. The repacker's tools
+
+Only needed to run `UERePacker.py`. Skip both if you are just walking a mod.
+
+UE4-DDS-Tools is pure Python and is used as a library, so only its `src` directory
+matters. The bundled `texconv` shared library is never loaded here, because it is only
+reached for sources that are not already `.dds`.
+
+```bash
+git clone --depth 1 --branch v0.6.1 \
+  https://github.com/matyalatte/UE4-DDS-Tools.git ~/Programs/Mo/UE4-DDS-Tools
+```
+
+UnrealReZen has to be built, and it has to be built from a patched checkout: a stock one
+misreads this game's container header and silently writes a container that declares no
+packages at all. `patches/` holds the two diffs and `TOOL-PATCHES.md` explains each change.
+
+```bash
+git clone --recurse-submodules --shallow-submodules --depth 1 \
+  https://github.com/rm-NoobInCoding/UnrealReZen.git /tmp/UnrealReZen
+cd /tmp/UnrealReZen
+git apply /path/to/UEWalker/patches/unrealrezen.patch
+git -C external/CUE4Parse apply /path/to/UEWalker/patches/cue4parse.patch
+dotnet publish UnrealReZen/UnrealReZen.csproj -c Release -r linux-x64 \
+  --self-contained false -o ~/Programs/Mo/UnrealReZen
+```
+
+It fetches its own zlib-ng on first run and writes it beside the executable, so the
+output directory has to stay writable.
+
+## 9. Point the script at everything
 
 Edit `UEWalkerConfig.py`:
 
