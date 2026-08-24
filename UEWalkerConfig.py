@@ -4,16 +4,16 @@
 
 
 #: Mod folder to walk. Overridden by argv[1] when run as a script.
-MOD_ROOT = "/path/to/mod"
+SOURCE_ROOT_DIR = "/path/to/source"
 
-#: Output tree, owned by the consumer: it writes each edited texture here under the
+#: Edit tree, owned by the consumer: it writes each edited texture here under the
 #: relative path it was yielded, keeping the name. The walk adds the `.dds.json`
 #: sidecars, a marker per finished container, and -- only where an edit appeared --
 #: the cooked package it came from, under `<container>/_cooked`.
-OUT_DIR = "/path/to/output"
+EDIT_ROOT_DIR = "/path/to/edits"
 
-#: Output for the patch files to be used for the new mod
-PATCH_DIR = "/path/to/result"
+#: Packed patch containers for the new mod, mirroring `EDIT_ROOT_DIR`'s tree.
+PATCH_ROOT_DIR = "/path/to/results"
 
 #: UE4-DDS-Tools `src` directory, imported by the repacker to write an edited `.dds`
 #: back into the cooked Zen asset it came from. It rewrites the texture's dimensions,
@@ -46,9 +46,8 @@ PATCH_COMPRESSION = "None"
 #: Prebuilt Linux binaries: https://github.com/trumank/retoc/releases
 RETOC_PATH = "retoc"
 
-#: Legacy `.pak` packer for that same pass, reached only by a container set with no
-#: `.utoc`, since retoc speaks IoStore only. Leave as-is for a pure IoStore mod.
-#: https://github.com/trumank/repak/releases
+#: Legacy `.pak` packer, reached only by a container set with no `.utoc`. Leave as-is
+#: for a pure IoStore mod. https://github.com/trumank/repak/releases
 REPAK_PATH = "repak"
 
 #: CUE4Parse.dll, loaded in-process through pythonnet. Build it with
@@ -70,7 +69,7 @@ DOTNET_RUNTIME_CONFIG: str | None = (
 #: than in the container shipping it, so a mod container cannot be decoded on its own.
 #: Only the two global files are ever mounted; the rest of the folder is untouched.
 #: None means IoStore mods will not decode, though legacy `.pak` ones still will.
-GAME_PAKS: str | None = "/path/to/game/End/Content/Paks"
+GAME_PAK_DIR: str | None = "/path/to/game/End/Content/Paks"
 
 #: AES key for encrypted containers. Mod-authored containers are normally plain.
 AES_KEY: str | None = None
@@ -96,12 +95,12 @@ UEWALKER_DEBUG = True
 
 
 #: Keep an untouched copy of every file an edit reached, as `backup-<name>` beside
-#: the edit in `OUT_DIR`. A deliberate duplicate: the same mip bytes are already in
+#: the edit in `EDIT_ROOT_DIR`. A deliberate duplicate: the same mip bytes are already in
 #: that texture's `_cooked` payload, this is just the readable form of them.
 BACKUP = False
 
 
-#: Resume mode: treat `OUT_DIR` as work already done. A container marked finished is
+#: Resume mode: treat `EDIT_ROOT_DIR` as work already done. A container marked finished is
 #: skipped before its payload is extracted, and inside one that was interrupted, a
 #: file already at its relative path is neither decoded nor yielded again.
 SKIP_EXISTING = True

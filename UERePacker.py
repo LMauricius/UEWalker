@@ -1,5 +1,5 @@
 """
-Pack the textures edited in `OUT_DIR` back into patch containers under `PATCH_DIR`.
+Pack the textures edited in `EDIT_ROOT_DIR` back into patch containers under `PATCH_ROOT_DIR`.
 
 The reverse of `UEWalker.py`, and its consumer: the walk leaves a `.dds.json` sidecar
 beside every texture it decoded and the cooked package under `<container>/_cooked` for
@@ -9,7 +9,7 @@ back has no `.dds` in the output, so it is never looked at, and the container it
 carries only what actually changed.
 
 The tree is mirrored at every step. A directory named `<name>.<ext>-extracted` is one
-container and becomes `<name>.utoc` at the same relative path under `PATCH_DIR`; anything
+container and becomes `<name>.utoc` at the same relative path under `PATCH_ROOT_DIR`; anything
 else is copied across unchanged, minus the walk's own bookkeeping.
 
 Two external tools do the heavy lifting, both configured in `UEWalkerConfig`:
@@ -20,7 +20,7 @@ Two external tools do the heavy lifting, both configured in `UEWalkerConfig`:
 - UnrealReZen packs the result. It must be the locally patched build; see `TOOL-PATCHES.md`
   for why a stock one silently emits a container that declares no packages.
 
-Run it with no arguments to pack `OUT_DIR` into `PATCH_DIR`.
+Run it with no arguments to pack `EDIT_ROOT_DIR` into `PATCH_ROOT_DIR`.
 """
 
 from __future__ import annotations
@@ -74,8 +74,8 @@ SIDECAR_SUFFIX = ".dds.json"
 BOOKKEEPING_NAMES = {DONE_MARKER}
 BOOKKEEPING_SUFFIXES = (SIDECAR_SUFFIX,)
 
-#: Where a package lives in the game, cached so a run costs one mount of `GAME_PAKS`
-#: instead of one per container. Lives in `PATCH_DIR`; delete it to rebuild.
+#: Where a package lives in the game, cached so a run costs one mount of `GAME_PAK_DIR`
+#: instead of one per container. Lives in `PATCH_ROOT_DIR`; delete it to rebuild.
 INDEX_NAME = ".uerepacker-index.json"
 
 #: Chunk kinds a packed package is made of. `.uptnl` is deliberately absent: injection
@@ -236,9 +236,9 @@ def require_tools() -> None:
         raise ToolError(f"UE4-DDS-Tools src not found: {UE4_DDS_TOOLS!r}")
     if not Path(UNREALREZEN_PATH).is_file():
         raise ToolError(f"UnrealReZen not found: {UNREALREZEN_PATH!r}")
-    paks = REZEN_GAME_DIR or GAME_PAKS
+    paks = REZEN_GAME_DIR or GAME_PAK_DIR
     if not paks or not Path(paks).is_dir():
-        raise ToolError(f"game Paks folder not found: {paks!r} (see GAME_PAKS)")
+        raise ToolError(f"game Paks folder not found: {paks!r} (see GAME_PAK_DIR)")
 
 
 # ---------------------------------------------------------------------------
@@ -321,9 +321,9 @@ class GameIndex:
     container. Handed a directory of symlinks to just the one or two containers a mod
     container actually needs, it takes half a second and 150 MB.
 
-    Building the map costs one mount of `GAME_PAKS`, and only the `.utoc` directory
+    Building the map costs one mount of `GAME_PAK_DIR`, and only the `.utoc` directory
     indexes are read: the 150 GB of `.ucas` payload beside them is never touched. The
-    result is cached in `PATCH_DIR`, so later runs usually mount nothing at all.
+    result is cached in `PATCH_ROOT_DIR`, so later runs usually mount nothing at all.
     """
 
     def __init__(self, cache: Path, paks: str) -> None:
@@ -393,7 +393,7 @@ class ContainerJob:
 
     @property
     def output(self) -> PurePosixPath:
-        """`.utoc` path relative to `PATCH_DIR`, mirroring where the container sat."""
+        """`.utoc` path relative to `PATCH_ROOT_DIR`, mirroring where the container sat."""
         return self.relative.parent / f"{self.stem}.utoc"
 
     def wanted_paths(self) -> set[str]:
@@ -421,8 +421,8 @@ class ModRepacker:
 
     def __init__(
         self,
-        out_dir: str | Path = OUT_DIR,
-        patch_dir: str | Path = PATCH_DIR,
+        out_dir: str | Path = EDIT_ROOT_DIR,
+        patch_dir: str | Path = PATCH_ROOT_DIR,
         game_paks: str | None = None,
         skip_existing: bool = SKIP_EXISTING,
         verify: bool = True,
@@ -430,7 +430,7 @@ class ModRepacker:
     ) -> None:
         self.out = Path(out_dir).resolve()
         self.patch = Path(patch_dir).resolve()
-        self.paks = game_paks or REZEN_GAME_DIR or GAME_PAKS
+        self.paks = game_paks or REZEN_GAME_DIR or GAME_PAK_DIR
         #: Restrict the run to one subtree, given relative to `out_dir`. Both roots stay
         #: where they are, so the mirrored layout and the cached index are unaffected.
         #: A walk still in progress is the usual reason: only the part it has finished
@@ -812,8 +812,8 @@ class ModRepacker:
 
 
 def repack(
-    out_dir: str | Path = OUT_DIR,
-    patch_dir: str | Path = PATCH_DIR,
+    out_dir: str | Path = EDIT_ROOT_DIR,
+    patch_dir: str | Path = PATCH_ROOT_DIR,
     only: str | None = None,
 ) -> int:
     """Convenience wrapper over `ModRepacker`; see it for semantics."""
@@ -828,4 +828,4 @@ if __name__ == "__main__":
     # `only` restricts the run to one subtree of the output without moving either root,
     # which is what a walk that is still filling the rest of it calls for.
     only = sys.argv[1] if len(sys.argv) > 1 else None
-    sys.exit(1 if repack(OUT_DIR, PATCH_DIR, only) else 0)
+    sys.exit(1 if repack(EDIT_ROOT_DIR, PATCH_ROOT_DIR, only) else 0)

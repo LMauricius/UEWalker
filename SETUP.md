@@ -161,10 +161,10 @@ The library shipped with the game or with an FF7R modding toolkit works equally 
 
 An IoStore package stores its script-object table in the game's `global.utoc`, not in
 the container that ships it, so a mod container cannot be decoded on its own. Point
-`GAME_PAKS` at the game's `Content/Paks` folder:
+`GAME_PAK_DIR` at the game's `Content/Paks` folder:
 
 ```python
-GAME_PAKS = "/path/to/FINAL FANTASY VII REBIRTH/End/Content/Paks"
+GAME_PAK_DIR = "/path/to/FINAL FANTASY VII REBIRTH/End/Content/Paks"
 ```
 
 Only `global.utoc` and `global.ucas` are ever read (about 2 MB together); the rest of
@@ -220,14 +220,14 @@ output directory has to stay writable.
 Edit `UEWalkerConfig.py`:
 
 ```python
-MOD_ROOT      = "/path/to/mod"
-OUT_DIR       = "/path/to/output"
+SOURCE_ROOT_DIR      = "/path/to/mod"
+EDIT_ROOT_DIR       = "/path/to/output"
 RETOC_PATH    = "retoc"                                   # or an absolute path
 REPAK_PATH    = "repak"
 CUE4PARSE_DLL = "/home/you/Programs/CUE4Parse/CUE4Parse.dll"   # a publish output; `~` is not expanded
-GAME_PAKS     = "/path/to/game/End/Content/Paks"          # read only for global.utoc/.ucas
+GAME_PAK_DIR     = "/path/to/game/End/Content/Paks"          # read only for global.utoc/.ucas
 BACKUP        = False                                     # True keeps a backup- copy of each edit
-SKIP_EXISTING = True                                      # resume: skip what OUT_DIR already holds
+SKIP_EXISTING = True                                      # resume: skip what EDIT_ROOT_DIR already holds
 OODLE_LIB     = None                                      # None = let CUE4Parse fetch it
 AES_KEY       = None                                      # mod containers are normally plain
 RETOC_VERSION = "UE4_26"

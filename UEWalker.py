@@ -5,7 +5,7 @@ Descends recursively: mod root -> .7z archives -> UE containers (.pak / .utoc+.u
 -> cooked Zen assets -> decoded .dds. Only the .7z layer is unpacked (py7zr); a UE
 container is mounted through CUE4Parse and read in place, so no cooked tree is written
 and no external binary is run. Yielded files are temporary: they live in the
-walk's scratch tree and each dies as the next one is produced. `OUT_DIR` belongs to
+walk's scratch tree and each dies as the next one is produced. `EDIT_ROOT_DIR` belongs to
 the consumer: it writes its edited textures there under the yielded relative path, and
 the walker follows behind, keeping only what an edit makes worth keeping -- the cooked
 package it came from, and optionally a `backup-` copy of the original. Edits are turned
@@ -122,7 +122,7 @@ def write_atomic(path: Path, payload: bytes) -> None:
     """
     Write a durable file so an interrupted run cannot leave a half one behind.
 
-    Everything in `OUT_DIR` outlives the walk and `skip_existing` trusts whatever is
+    Everything in `EDIT_ROOT_DIR` outlives the walk and `skip_existing` trusts whatever is
     already there, so a truncated file would be believed on every later run. The
     rename is atomic within a directory: the file is either the previous content or
     the new one, never a prefix of it.
@@ -313,7 +313,7 @@ def global_dir() -> str | None:
 
     An IoStore package resolves its script objects through the game's global
     container, so a mod container alone cannot be read. Only `global.utoc` and
-    `global.ucas` are wanted, and `GAME_PAKS` also holds the game's full content
+    `global.ucas` are wanted, and `GAME_PAK_DIR` also holds the game's full content
     (well over a hundred gigabytes), which the provider would otherwise index in
     its entirety: the two files are symlinked into a directory of their own and
     that is mounted instead. Returns None when the global container is unavailable,
@@ -323,11 +323,11 @@ def global_dir() -> str | None:
         return _GLOBAL_DIR["path"]
 
     _GLOBAL_DIR["path"] = None
-    if not GAME_PAKS:
-        log.warning("GAME_PAKS is unset: IoStore containers cannot be decoded")
+    if not GAME_PAK_DIR:
+        log.warning("GAME_PAK_DIR is unset: IoStore containers cannot be decoded")
         return None
 
-    paks = Path(GAME_PAKS)
+    paks = Path(GAME_PAK_DIR)
     members = [paks / "global.utoc", paks / "global.ucas"]
     if missing := [m.name for m in members if not m.is_file()]:
         log.warning("%s: no %s: IoStore containers cannot be decoded", paks, ", ".join(missing))
@@ -927,8 +927,8 @@ class ModWalker:
 
     def __init__(
         self,
-        mod_root: str | Path = MOD_ROOT,
-        out_dir: str | Path = OUT_DIR,
+        mod_root: str | Path = SOURCE_ROOT_DIR,
+        out_dir: str | Path = EDIT_ROOT_DIR,
         selective: bool = False,
         backup: bool = BACKUP,
         skip_existing: bool = SKIP_EXISTING,
@@ -1291,7 +1291,7 @@ def fileIterator(
     backup: bool = BACKUP, skip_existing: bool = SKIP_EXISTING
 ) -> Iterator[WalkItem]:
     """Convenience wrapper over `ModWalker`; see it for semantics."""
-    return iter(ModWalker(MOD_ROOT, OUT_DIR, False, backup, skip_existing))
+    return iter(ModWalker(SOURCE_ROOT_DIR, EDIT_ROOT_DIR, False, backup, skip_existing))
 
 
 if __name__ == "__main__":
