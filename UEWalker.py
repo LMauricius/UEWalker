@@ -8,7 +8,8 @@ and no external binary is run. Yielded files are temporary: they live in the
 walk's scratch tree and each dies as the next one is produced. `EDIT_ROOT_DIR` belongs to
 the consumer: it writes its edited textures there under the yielded relative path, and
 the walker follows behind, keeping only what an edit makes worth keeping -- the cooked
-package it came from, and optionally a `backup-` copy of the original. Edits are turned
+package it came from (into `UASSET_DIR`, whose tree mirrors the edit tree), and
+optionally a `backup-` copy of the original. Edits are turned
 into patch containers later, by a separate pass; nothing unedited is ever stored.
 See `ModWalker` / `fileIterator` for the public entry points.
 """
@@ -45,10 +46,6 @@ from UEWalkerConfig import *
 IMAGE_EXTS = {".png", ".dds", ".tga", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
 SEVENZIP_EXTS = {".7z"}
 UE_EXTS = {".pak", ".ucas", ".utoc"}
-
-#: Subdirectory of a container's output directory holding the cooked assets an edit
-#: has to be spliced back into. Only edited packages are ever written there.
-COOKED_DIR = "_cooked"
 
 #: Prefix marking an untouched copy. Also excluded from image scans, so a backup is
 #: never mistaken for a texture on a later pass over the same output directory.
@@ -285,6 +282,18 @@ def archive_segment(relpath: str) -> str:
     """
     p = PurePosixPath(relpath)
     return join_rel(str(p.parent), p.name + "-extracted")
+
+
+def flat_dds(root: Path, name: str, flat: bool) -> Path:
+    """
+    Where one decoded texture goes: `<root>/<name>.dds`, or `<root>.dds` when `flat`.
+
+    A package holding a single texture named after it needs no directory of its own, so
+    the `-extracted` tag moves onto the file itself: `Foo.uasset-extracted.dds` rather
+    than `Foo.uasset-extracted/Foo.dds`. Both shapes carry the same information, and the
+    patch pass tells them apart by which of the two wears the tag.
+    """
+    return root.with_name(root.name + ".dds") if flat else root / f"{name}.dds"
 
 
 #: `<base>_P`, `<base>_P2`, ... : UE's patch-container naming.
@@ -685,25 +694,33 @@ class TextureDecoder:
         """
         Decode every texture export in one cooked package; returns the .dds written.
 
-        `dest` takes the `.dds` the consumer edits, `meta` the sidecars the patch pass
-        reads, so a scratch texture and its durable metadata can live apart. `done` is
-        asked about each `.dds` name before any of its payload is touched, so a texture
-        the consumer has already dealt with costs nothing but the package load.
+        `dest` is the directory the package would own under the scratch tree and `meta`
+        the same directory under the durable one, so a scratch texture and its sidecar
+        can live apart. A package holding a single texture named after itself gets no
+        directory at all: both files land beside it instead (see `flat_dds`), which is
+        why every path here, `done` included, is expressed relative to `dest`'s parent
+        rather than to `dest`. `done` is asked before any payload is touched, so a
+        texture the consumer has already dealt with costs nothing but the package load.
         """
         # Keys come from the provider's own index, so they always address a package.
         pkg_path = key.rsplit(".", 1)[0]
         log.debug("decoding package %s", pkg_path)
         package = self.provider.LoadPackage(pkg_path)
 
-        # The two directories are created by `_write_texture`, not here: a package that
-        # decodes nothing (no texture export, or no reachable mip) must not leave an
-        # empty `-extracted` directory behind in the output tree.
+        # Every texture export is found before any is written: whether the package is
+        # flat depends on how many there are, and the first path built already needs
+        # the answer.
+        textures = [(e, m) for e in package.GetExports()
+                    if (m := self._mips_of(e)) is not None]
+        flat = (len(textures) == 1
+                and str(textures[0][0].Name) == PurePosixPath(pkg_path).name)
+
+        # Directories are created by `_write_texture`, not here: a package that decodes
+        # nothing (no texture export, or no reachable mip) must not leave an empty
+        # `-extracted` directory behind in the output tree.
         written: list[Path] = []
         taken: set[str] = set()
-        for export in package.GetExports():
-            mips = self._mips_of(export)
-            if mips is None:
-                continue
+        for export, mips in textures:
             # Two exports of one package can share a name. They would otherwise write
             # the same .dds, leaving the consumer the second one's bytes under the
             # first one's name, so a repeat is suffixed rather than allowed to collide.
@@ -713,9 +730,12 @@ class TextureDecoder:
                 log.warning("%s: duplicate export name %s, writing as %s",
                             pkg_path, export.Name, name)
             taken.add(name)
-            if done(f"{name}.dds"):
+            dds_path = flat_dds(dest, name, flat)
+            if done(dds_path.relative_to(dest.parent).as_posix()):
                 continue
-            written.append(self._write_texture(export, mips, name, dest, meta, pkg_path))
+            written.append(self._write_texture(
+                export, mips, name, dds_path, flat_dds(meta, name, flat), pkg_path
+            ))
         log.debug("%s: %d texture(s) decoded", pkg_path, len(written))
         return sorted(written)
 
@@ -734,7 +754,7 @@ class TextureDecoder:
         be, and the returned paths do not always agree: `SavePackage` keys the `.uasset`
         and `.ubulk` off the provider index but finds an optional (`.uptnl`) payload
         through the owning container's own index instead, which is mounted somewhere else
-        entirely. Trusting that key drops the `.uptnl` at the root of `_cooked`, where
+        entirely. Trusting that key drops the `.uptnl` at the root of the store, where
         nothing reading the package can find it.
         """
 
@@ -792,9 +812,14 @@ class TextureDecoder:
         return mips
 
     def _write_texture(
-        self, export, mips, name: str, dest: Path, meta: Path, pkg_path: str
+        self, export, mips, name: str, dds_path: Path, meta_dds: Path, pkg_path: str
     ) -> Path:
-        """Write one export as `<name>.dds` in `dest` plus its sidecar in `meta`."""
+        """
+        Write one export to `dds_path`, plus its sidecar beside `meta_dds`.
+
+        `meta_dds` is where the same texture would sit in the durable tree; only the
+        sidecar is written there, under that name plus `.json`.
+        """
         pixel_format = str(export.PlatformData.PixelFormat)
         if pixel_format not in PIXEL_FORMATS:
             raise RuntimeError(f"unsupported pixel format {pixel_format} in {pkg_path}")
@@ -833,9 +858,8 @@ class TextureDecoder:
             raise RuntimeError(f"no usable mip payload for {export.Name} in {pkg_path}")
 
         mips, top = kept, kept[0]
-        dest.mkdir(parents=True, exist_ok=True)
-        meta.mkdir(parents=True, exist_ok=True)
-        dds_path = dest / f"{name}.dds"
+        dds_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_dds.parent.mkdir(parents=True, exist_ok=True)
         log.debug(
             "texture %s (%s%s %dx%d, %d mips)",
             name,
@@ -872,7 +896,7 @@ class TextureDecoder:
             "dxgi_format": dxgi_of(pixel_format),
             "mips": records,
         }
-        sidecar_path = meta / f"{dds_path.name}.json"
+        sidecar_path = meta_dds.with_name(meta_dds.name + ".json")
         # Rewritten whenever it would not come out identical, which covers a truncated
         # leftover (it does not parse) and one an older version wrote with different
         # fields, without needing to know which version that was.
@@ -890,17 +914,20 @@ class ModWalker:
     Recursive texture walker over a mod folder.
 
     Yields `(absolute path, path relative to the mod root)`. Every archive adds a
-    `<name><ext>-extracted` segment, and a cooked asset adds one too, so a nested
-    texture reads as `abc.7z-extracted/def.utoc-extracted/Game/Foo.uasset-extracted/Foo.dds`.
+    `<name><ext>-extracted` segment, and so does a cooked asset holding more than one
+    texture, so a nested one reads as
+    `abc.7z-extracted/def.utoc-extracted/Game/Foo.uasset-extracted/Bar.dds`. A package
+    holding a single texture named after itself is flattened to
+    `abc.7z-extracted/def.utoc-extracted/Game/Foo.uasset-extracted.dds` instead.
 
     The consumer owns `edit_root_dir`: it writes its edited version of a yielded file there,
     under the same relative path and the same name, before asking for the next file.
     The walker follows behind it. Every texture gets its `.dds.json` sidecar, and a
     container handed over whole gets a `.uewalker-done` marker; beyond that, only an
     edit makes anything worth storing. When one appears, the cooked package it was
-    decoded from is written into `<container>/_cooked`, and with `backup` on the
-    untouched original is kept beside the edit as `backup-<name>`. An unedited texture
-    costs nothing but its sidecar.
+    decoded from is written under `asset_root_dir`, whose tree mirrors the edit one,
+    and with `backup` on the untouched original is kept beside the edit as
+    `backup-<name>`. An unedited texture costs nothing but its sidecar.
 
     With `skip_existing` on, `edit_root_dir` is read back as the record of previous walks.
     A container whose marker is there is skipped before its payload leaves the
@@ -929,12 +956,16 @@ class ModWalker:
         self,
         source_root_dir: str | Path = SOURCE_ROOT_DIR,
         edit_root_dir: str | Path = EDIT_ROOT_DIR,
+        asset_root_dir: str | Path = UASSET_DIR,
         selective: bool = False,
         backup: bool = BACKUP,
         skip_existing: bool = SKIP_EXISTING,
     ) -> None:
         self.root = Path(source_root_dir).resolve()
         self.out = Path(edit_root_dir).resolve()
+        #: Cooked packages behind the edits, mirroring `out`'s tree. Only written to
+        #: where an edit appeared, and the only durable output that is not next to it.
+        self.assets = Path(asset_root_dir).resolve()
         #: One extract call per member instead of one per group. Bounds peak disk on a
         #: huge archive, at the cost of re-decoding a solid archive once per member.
         self.selective = selective
@@ -1006,10 +1037,11 @@ class ModWalker:
         for child in sorted(self.root.rglob("*")):
             if not child.is_file():
                 continue
-            # The output tree may sit inside the mod root: the consumer's edits, the
+            # The output trees may sit inside the mod root: the consumer's edits, the
             # backups and the cooked sources are this walk's own product, not mod
             # content to walk again.
-            if self.out in child.parents or child.name.startswith(BACKUP_PREFIX):
+            if (self.out in child.parents or self.assets in child.parents
+                    or child.name.startswith(BACKUP_PREFIX)):
                 continue
             rel = child.relative_to(self.root).as_posix()
             log.debug("disk: %s", rel)
@@ -1088,13 +1120,18 @@ class ModWalker:
         """Decode every package in the container at `mount`, one at a time."""
         # Mounts once, reused for every asset below.
         decoder = TextureDecoder(mount, self.skip_existing)
-        cooked = self.out / prefix / COOKED_DIR
+        cooked = self.assets / prefix
         # Assets come from the provider's own index, which is the only authority on
         # what the container holds and how its packages are addressed.
         assets = decoder.packages()
         log.debug("%s: %d cooked asset(s)", prefix, len(assets))
         for asset in assets:
             asset_rel = join_rel(prefix, archive_segment(asset))
+            # A single-texture package writes its .dds where its directory would have
+            # been, so both the resume check and the delivered path are built against
+            # that directory's parent rather than against the directory itself.
+            parent_rel = str(PurePosixPath(asset_rel).parent)
+            work_dir = self.work / asset_rel
             # Saved at most once even when several edited exports share the package:
             # its `.ubulk` is the whole mip chain, so a repeat is megabytes of nothing.
             # Both captures are explicit: this runs when the consumer asks for the next
@@ -1109,12 +1146,15 @@ class ModWalker:
                 # skipped texture's mips are marshalled out of .NET at all.
                 for image in decoder.decode(
                     asset,
-                    self.work / asset_rel,
+                    work_dir,
                     self.out / asset_rel,
-                    lambda name: self._done(join_rel(asset_rel, name)),
+                    lambda rel: self._done(join_rel(parent_rel, rel)),
                 ):
                     yield from self._deliver(
-                        image, join_rel(asset_rel, image.name), save_cooked
+                        image,
+                        join_rel(parent_rel,
+                                 image.relative_to(work_dir.parent).as_posix()),
+                        save_cooked,
                     )
 
     # -- emission -------------------------------------------------------------
@@ -1291,7 +1331,9 @@ def fileIterator(
     backup: bool = BACKUP, skip_existing: bool = SKIP_EXISTING
 ) -> Iterator[WalkItem]:
     """Convenience wrapper over `ModWalker`; see it for semantics."""
-    return iter(ModWalker(SOURCE_ROOT_DIR, EDIT_ROOT_DIR, False, backup, skip_existing))
+    return iter(
+        ModWalker(SOURCE_ROOT_DIR, EDIT_ROOT_DIR, UASSET_DIR, False, backup, skip_existing)
+    )
 
 
 if __name__ == "__main__":

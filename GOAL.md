@@ -16,5 +16,6 @@ Iterate over all actual files inside the mod. Each iteration goes as follows:
 The relative path should be constructed as follows:
 - Starts from the mod root
 - Each archive file becomes a directory segment. Preserve archive extension, add -extracted (e.g. abc.7z-extracted/def.ucas-extracted/texture.dds)
+- A cooked asset holding a single texture named after it becomes a file segment instead: the -extracted tag goes on the .dds itself (e.g. abc.7z-extracted/def.ucas-extracted/Foo.uasset-extracted.dds), since a directory of one predictable file adds nothing
 
 Process only image files

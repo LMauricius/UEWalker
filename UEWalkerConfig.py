@@ -8,9 +8,16 @@ SOURCE_ROOT_DIR = "/path/to/source"
 
 #: Edit tree, owned by the consumer: it writes each edited texture here under the
 #: relative path it was yielded, keeping the name. The walk adds the `.dds.json`
-#: sidecars, a marker per finished container, and -- only where an edit appeared --
-#: the cooked package it came from, under `<container>/_cooked`.
-EDIT_ROOT_DIR = "/path/to/edits"
+#: sidecars and a marker per finished container; the cooked package behind an edit goes
+#: to `UASSET_DIR` instead.
+EDIT_ROOT_DIR = "/path/to/edits/"
+
+#: Original cooked assets, mirroring `EDIT_ROOT_DIR`'s tree: a container directory there
+#: holds, at the package's own path, the `.uasset` (plus `.ubulk`/`.uptnl`) every edited
+#: texture was decoded from. Written by the walk only where an edit appeared, and read
+#: back by the repacker as the payload an edit is spliced into. Kept apart from the edits
+#: so the edit tree stays small enough to hand around; both trees are needed to repack.
+UASSET_DIR = "/path/to/uassets"
 
 #: Packed patch containers for the new mod, mirroring `EDIT_ROOT_DIR`'s tree.
 PATCH_ROOT_DIR = "/path/to/results"

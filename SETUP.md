@@ -222,6 +222,7 @@ Edit `UEWalkerConfig.py`:
 ```python
 SOURCE_ROOT_DIR = "/path/to/mod"
 EDIT_ROOT_DIR   = "/path/to/output"
+UASSET_DIR      = "/path/to/assets"                         # cooked originals behind the edits
 RETOC_PATH      = "retoc"                                   # or an absolute path
 REPAK_PATH      = "repak"
 CUE4PARSE_DLL   = "/home/you/Programs/CUE4Parse/CUE4Parse.dll"   # a publish output; `~` is not expanded

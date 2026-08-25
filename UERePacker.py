@@ -2,11 +2,12 @@
 Pack the textures edited in `EDIT_ROOT_DIR` back into patch containers under `PATCH_ROOT_DIR`.
 
 The reverse of `UEWalker.py`, and its consumer: the walk leaves a `.dds.json` sidecar
-beside every texture it decoded and the cooked package under `<container>/_cooked` for
-every texture an edit reached, and this turns those into `.utoc`/`.ucas`/`.pak` triplets
-the game can mount. Only edited textures are packed. A texture the consumer never wrote
-back has no `.dds` in the output, so it is never looked at, and the container it lived in
-carries only what actually changed.
+beside every texture it decoded and, for every texture an edit reached, the cooked
+package under `UASSET_DIR`. That tree mirrors `EDIT_ROOT_DIR`'s, so a container directory
+sits at the same relative path in both, and this turns the pair into `.utoc`/`.ucas`/`.pak`
+triplets the game can mount. Only edited textures are packed. A texture the consumer never
+wrote back has no `.dds` in the output, so it is never looked at, and the container it
+lived in carries only what actually changed.
 
 The tree is mirrored at every step. A directory named `<name>.<ext>-extracted` is one
 container and becomes `<name>.utoc` at the same relative path under `PATCH_ROOT_DIR`; anything
@@ -37,7 +38,6 @@ from pathlib import Path, PurePosixPath
 
 from UEWalker import (
     BACKUP_PREFIX,
-    COOKED_DIR,
     DONE_MARKER,
     CUE4Parse,
     ToolError,
@@ -118,19 +118,24 @@ def is_bookkeeping(path: Path) -> bool:
     )
 
 
-def package_of(asset_dir: Path, container: Path) -> str:
+def package_of(dds: Path, container: Path) -> str:
     """
-    Package path a `<package>.uasset-extracted` directory stands for.
+    Package path an edited `.dds` belongs to.
 
-    `<container>/End/Content/Foo/Bar.uasset-extracted` -> `End/Content/Foo/Bar`.
+    `<container>/End/Content/Foo/Bar.uasset-extracted/Bar.dds` -> `End/Content/Foo/Bar`,
+    and so does the flat shape the walk writes for a package holding a single texture
+    named after it, `<container>/End/Content/Foo/Bar.uasset-extracted.dds`. The tag is on
+    the directory in one and on the file in the other, which is what tells them apart.
     """
-    rel = asset_dir.relative_to(container).as_posix()
+    inner = dds.name[: -len(".dds")]
+    node = dds.with_name(inner) if inner.endswith(EXTRACTED_SUFFIX) else dds.parent
+    rel = node.relative_to(container).as_posix()
     return rel[: -len(EXTRACTED_SUFFIX)].rsplit(".", 1)[0]
 
 
 def cooked_asset(cooked: Path, package: str) -> Path | None:
     """
-    The `.uasset` under `_cooked` holding `package`, or None if the walk never saved it.
+    The `.uasset` in the asset store holding `package`, or None if the walk never saved it.
 
     `save_package` writes each chunk at the path CUE4Parse hands back, and those are
     relative to the container's mount point rather than to the package root, so
@@ -152,10 +157,10 @@ def cooked_parts(asset: Path, cooked: Path) -> dict[str, Path]:
 
     They sit together in anything `save_package` writes now, but output from before it
     anchored every chunk on the package path can have an optional-mip (`.uptnl`) chunk at
-    the root of `_cooked` instead of beside its own package. UE4-DDS-Tools resolves the
-    chunks as siblings of the `.uasset` and fails outright when one is missing, so a stray
-    is looked up by name and reported here for the caller to stage. Re-walking a mod just
-    to move those is not worth it, so this stays.
+    the root of the container's store instead of beside its own package. UE4-DDS-Tools
+    resolves the chunks as siblings of the `.uasset` and fails outright when one is
+    missing, so a stray is looked up by name and reported here for the caller to stage.
+    Re-walking a mod just to move those is not worth it, so this stays.
     """
 
     parts = {".uasset": asset}
@@ -166,7 +171,7 @@ def cooked_parts(asset: Path, cooked: Path) -> dict[str, Path]:
             continue
         stray = cooked / f"{asset.stem}{ext}"
         if stray.is_file():
-            log.debug("%s: %s is at the root of _cooked", asset.stem, stray.name)
+            log.debug("%s: %s is at the store root", asset.stem, stray.name)
             parts[ext] = stray
     return parts
 
@@ -385,7 +390,7 @@ class ContainerJob:
     stem: str
     #: Package path -> its edits, ordered as the walk yielded them.
     packages: dict[str, list[Edit]] = field(default_factory=dict)
-    #: Package path -> the `.uasset` under `_cooked` it has to be written into.
+    #: Package path -> the `.uasset` in the asset store it has to be written into.
     cooked: dict[str, Path] = field(default_factory=dict)
     #: Packages the game does not ship, so no chunk ID or store entry can be sourced for
     #: them. A mod that adds a texture rather than replacing one lands here.
@@ -423,6 +428,7 @@ class ModRepacker:
         self,
         edit_root_dir: str | Path = EDIT_ROOT_DIR,
         patch_root_dir: str | Path = PATCH_ROOT_DIR,
+        asset_root_dir: str | Path = UASSET_DIR,
         game_pak_dir: str | None = None,
         skip_existing: bool = SKIP_EXISTING,
         verify: bool = True,
@@ -430,6 +436,9 @@ class ModRepacker:
     ) -> None:
         self.out = Path(edit_root_dir).resolve()
         self.patch = Path(patch_root_dir).resolve()
+        #: Cooked packages the walk kept, at the same relative paths as the edits.
+        #: Read-only here: it is the reversibility record, and a repack must not touch it.
+        self.assets = Path(asset_root_dir).resolve()
         self.paks = game_pak_dir or REZEN_GAME_DIR or GAME_PAK_DIR
         #: Restrict the run to one subtree, given relative to `edit_root_dir`. Both
         #: roots stay where they are, so the mirrored layout and the cached index are
@@ -454,6 +463,11 @@ class ModRepacker:
         """Pack every container and mirror everything else. Returns the failure count."""
         require_tools()
         log.info("repacking %s -> %s", self.out, self.patch)
+        # Nothing can be injected without the cooked originals, so a mistyped or unmounted
+        # store is worth saying once here rather than once per package further down.
+        if not self.assets.is_dir():
+            log.warning("asset store %s is missing; no package can be repacked", self.assets)
+        log.debug("cooked assets from %s", self.assets)
         self.patch.mkdir(parents=True, exist_ok=True)
         sweep_stale_scratch()
 
@@ -512,9 +526,9 @@ class ModRepacker:
 
     def _collect(self, job: ContainerJob) -> None:
         """Gather the edits in one container and the cooked assets they belong to."""
-        cooked_root = job.source / COOKED_DIR
+        cooked_root = self.assets / job.relative
         for dds in sorted(job.source.rglob("*.dds")):
-            if dds.name.startswith(BACKUP_PREFIX) or cooked_root in dds.parents:
+            if dds.name.startswith(BACKUP_PREFIX):
                 continue
             with self._guard(str(job.relative / dds.name)):
                 edit = self._edit_of(dds, job)
@@ -522,7 +536,7 @@ class ModRepacker:
                     asset = cooked_asset(cooked_root, edit.package)
                     if asset is None:
                         raise RuntimeError(
-                            f"{edit.package}: edited but no cooked package in {COOKED_DIR}"
+                            f"{edit.package}: edited but no cooked package in {cooked_root}"
                         )
                     job.cooked[edit.package] = asset
                     job.packages[edit.package] = []
@@ -533,7 +547,7 @@ class ModRepacker:
         # The sidecar is what the decoder wrote, so it names the package and the export
         # even when the export's name was suffixed to dodge a collision on disk.
         sidecar = read_json(dds.with_name(dds.name + ".json"))
-        package = package_of(dds.parent, job.source)
+        package = package_of(dds, job.source)
         if isinstance(sidecar, dict):
             if sidecar.get("package") and sidecar["package"] != package:
                 log.warning("%s: sidecar says %s, path says %s; trusting the sidecar",
@@ -600,7 +614,7 @@ class ModRepacker:
         for package, edits in sorted(job.packages.items()):
             with self._guard(package):
                 asset = job.cooked[package]
-                parts = cooked_parts(asset, job.source / COOKED_DIR)
+                parts = cooked_parts(asset, self.assets / job.relative)
                 inject(self._readable(asset, parts, work, package), edits,
                        content / f"{package}.uasset")
                 written.add(package)
@@ -818,7 +832,7 @@ def repack(
     only: str | None = None,
 ) -> int:
     """Convenience wrapper over `ModRepacker`; see it for semantics."""
-    return ModRepacker(edit_root_dir, patch_root_dir, only=only).run()
+    return ModRepacker(edit_root_dir, patch_root_dir, UASSET_DIR, only=only).run()
 
 
 if __name__ == "__main__":
