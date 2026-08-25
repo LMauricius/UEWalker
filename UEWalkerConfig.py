@@ -40,7 +40,7 @@ UNREALREZEN_PATH = "UnrealReZen/UnrealReZen"
 #: Container the repacker reads chunk IDs and package store entries out of. Only the
 #: `.utoc` directory indexes and one header chunk per container are touched, never the
 #: `.ucas` payload, so pointing this at the whole game costs seconds rather than the
-#: 150 GB the folder holds. None falls back to `GAME_PAKS`.
+#: 150 GB the folder holds. None falls back to `GAME_PAK_DIR`.
 REZEN_GAME_DIR: str | None = None
 
 #: Compression for the packed container: None, Zlib, Oodle, or LZ4. `None` keeps the
@@ -103,7 +103,7 @@ UEWALKER_DEBUG = True
 
 #: Keep an untouched copy of every file an edit reached, as `backup-<name>` beside
 #: the edit in `EDIT_ROOT_DIR`. A deliberate duplicate: the same mip bytes are already in
-#: that texture's `_cooked` payload, this is just the readable form of them.
+#: that texture's `UASSET_DIR` payload, this is just the readable form of them.
 BACKUP = False
 
 
@@ -111,3 +111,31 @@ BACKUP = False
 #: skipped before its payload is extracted, and inside one that was interrupted, a
 #: file already at its relative path is neither decoded nor yielded again.
 SKIP_EXISTING = True
+
+
+# ---------------------------------------------------------------------------
+# Per-directory overrides
+# ---------------------------------------------------------------------------
+
+#: Any setting above can be overridden from `uewalker.ini` in the directory the script
+#: was launched from, so one checkout can serve several mods without being edited.
+#: One `KEY = value` per line, keys named as the settings are, `#` and `;` start a comment
+#: Values are taken as plain strings, except that a bool setting reads as a bool and
+#: `None` (any case) reads as None. Relative paths resolve against the working dir.
+#: `UEWALKER_INI` names a different file. A key that is not a setting above raises.
+import configparser as _configparser
+import os as _os
+
+CONFIG_INI = _os.path.abspath("uewalker.ini")
+print(f"Loading config from {CONFIG_INI}")
+_parser = _configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+_parser.optionxform = str  # keep key case; settings are upper case
+# configparser demands a section; the file has none, so one is prepended.
+_parser.read_string("[c]\n" + open(CONFIG_INI, encoding="utf-8").read())
+for _key, _val in _parser["c"].items():
+    if isinstance(globals()[_key], bool):  # KeyError names a misspelled setting
+        globals()[_key] = _parser.getboolean("c", _key)
+    elif _val.lower() == "none":
+        globals()[_key] = None
+    else:
+        globals()[_key] = _val
