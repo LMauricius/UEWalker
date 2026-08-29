@@ -171,7 +171,28 @@ Only `global.utoc` and `global.ucas` are ever read (about 2 MB together); the re
 the folder is left alone and never indexed. Leaving this as `None` is allowed: legacy
 `.pak` mods still decode, while IoStore ones report `global data is missing` per asset.
 
-## 7. repak (optional)
+## 7. Type mappings (`.usmap`)
+
+Packages cooked with unversioned properties carry property *indices* instead of names,
+and only a mappings dump turns those back into names. Without one, CUE4Parse raises
+`MappingException: Package has unversioned properties but mapping file is missing` and
+the asset is skipped. Mod containers that only replace textures often survive without
+it; the game's own containers largely do not.
+
+The file is dumped from the running game on Windows, with
+[Dumper-7](https://github.com/Encryqed/Dumper-7),
+[UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) (`dumpusmap`), or
+[UnrealMappingsDumper](https://github.com/OutTheShade/UnrealMappingsDumper); a community
+dump for the same game build works just as well. Then point the global at it:
+
+```python
+USMAP_PATH = "/path/to/game.usmap"
+```
+
+It is parsed once per run and shared by every container. A dump that does not parse
+(wrong version, truncated) aborts the walk rather than failing asset by asset.
+
+## 8. repak (optional)
 
 Only if a mod contains a `.pak` with no matching `.utoc`:
 
@@ -181,7 +202,7 @@ curl -sSL https://github.com/trumank/repak/releases/latest/download/repak_cli-x8
 install /tmp/repak_cli-x86_64-unknown-linux-gnu/repak ~/.local/bin/
 ```
 
-## 8. The repacker's tools
+## 9. The repacker's tools
 
 Only needed to run `UERePacker.py`. Skip both if you are just walking a mod.
 
@@ -215,7 +236,7 @@ later upstream change to any of them makes `git apply` fail.
 It fetches its own zlib-ng on first run and writes it beside the executable, so the
 output directory has to stay writable.
 
-## 9. Point the script at everything
+## 10. Point the script at everything
 
 Edit `UEWalkerConfig.py`:
 
@@ -231,6 +252,7 @@ BACKUP          = False                                     # True keeps a backu
 SKIP_EXISTING   = True                                      # resume: skip what EDIT_ROOT_DIR already holds
 OODLE_LIB       = None                                      # None = let CUE4Parse fetch it
 AES_KEY         = None                                      # mod containers are normally plain
+USMAP_PATH      = None                                      # type mappings; see section 7
 RETOC_VERSION   = "UE4_26"
 UE_VERSION      = "GAME_UE4_26"
 DOTNET_RUNTIME_CONFIG = "/home/you/Programs/CUE4Parse/cue4parse-fetch.runtimeconfig.json"
@@ -240,7 +262,7 @@ DOTNET_RUNTIME_CONFIG = "/home/you/Programs/CUE4Parse/cue4parse-fetch.runtimecon
 both 8.0 and 10.0 side by side is common): it tells `pythonnet` which version to boot
 instead of letting it guess. The file sits beside `CUE4Parse.dll` in the build output.
 
-## 9. Verify
+## 11. Verify
 
 ```bash
 python checktools.py                  # every dependency, in the order the walk hits them

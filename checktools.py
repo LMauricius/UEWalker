@@ -199,6 +199,24 @@ def check_cue4parse() -> str:
     return f"CLR up, {UE_VERSION} resolved, {oodle} loaded"
 
 
+def check_usmap() -> str:
+    """Parse the configured `.usmap`, reporting how many types it maps."""
+    if not USMAP_PATH:
+        raise RuntimeError(
+            "USMAP_PATH unset: packages with unversioned properties cannot be "
+            "serialized (MappingException), which is most of the game's own containers"
+        )
+    if not Path(USMAP_PATH).is_file():
+        raise RuntimeError(f"USMAP_PATH missing: {USMAP_PATH}")
+    # Constructing the provider parses the file, so a truncated or wrong-version dump
+    # fails here rather than mid-walk. `Types` is the mapped-class table.
+    mappings = W.mappings_container()
+    types = mappings.MappingsForGame.Types.Count
+    if not types:
+        raise RuntimeError(f"{USMAP_PATH} parsed but maps no types")
+    return f"{types} type(s) from {Path(USMAP_PATH).name}"
+
+
 def check_dds_writer() -> str:
     """The pure-python DDS packer: header length, magic and payload passthrough."""
     mips = [b"\x11" * 8, b"\x22" * 8]
@@ -262,6 +280,9 @@ def main() -> int:
         )
         check(".NET layout", check_dotnet_layout)
         check("CUE4Parse", check_cue4parse)
+        # A skip only costs the packages that carry unversioned properties, so the
+        # walk still runs without mappings; it just loses those assets.
+        optional("type mappings (.usmap)", check_usmap)
         check("DDS writer", check_dds_writer)
         if utoc is None:
             report("container end-to-end", "skip", "pass a .utoc to run it")

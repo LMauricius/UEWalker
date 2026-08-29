@@ -47,6 +47,7 @@ from UEWalker import (
     release_scratch,
     scratch_dir,
     scratch_guard,
+    submit_aes_key,
     sweep_stale_scratch,
     write_json,
 )
@@ -363,8 +364,7 @@ class GameIndex:
             t["DirectoryInfo"](self.paks), t["SearchOption"].TopDirectoryOnly, True, versions
         )
         provider.Initialize()
-        if AES_KEY:
-            provider.SubmitKey(AES_KEY)
+        submit_aes_key(provider)
         provider.Mount()
         files = provider.Files
         found = {}

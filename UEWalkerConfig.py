@@ -81,6 +81,14 @@ GAME_PAK_DIR: str | None = "/path/to/game/End/Content/Paks"
 #: AES key for encrypted containers. Mod-authored containers are normally plain.
 AES_KEY: str | None = None
 
+#: Type mappings (`.usmap`) for the game. Packages cooked with unversioned properties
+#: carry property *indices* rather than names, so CUE4Parse cannot serialize an export
+#: out of one without the mapping; it raises `MappingException` and the asset is
+#: skipped. Mod containers that only replace textures often get by without it, the
+#: game's own containers do not. Dumped from the running game (Dumper-7, UE4SS,
+#: UnrealMappingsDumper) or taken from a community dump; None means no mappings.
+USMAP_PATH: str | None = None
+
 #: Oodle library (`liboodle-data-shared.so`). None lets CUE4Parse fetch an
 #: open-source build itself on first use: https://github.com/WorkingRobot/OodleUE
 OODLE_LIB: str | None = None

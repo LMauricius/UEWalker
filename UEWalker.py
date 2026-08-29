@@ -369,6 +369,11 @@ def require_tools() -> None:
     if not Path(CUE4PARSE_DLL).is_file():
         log.error("CUE4Parse.dll not found: %r (see UEWalkerConfig)", CUE4PARSE_DLL)
         raise ToolError(f"CUE4Parse.dll not found: {CUE4PARSE_DLL!r}")
+    # Configured and absent is a typo, not a missing feature: every package with
+    # unversioned properties would fail one by one, far from the cause.
+    if USMAP_PATH and not Path(USMAP_PATH).is_file():
+        log.error("USMAP_PATH not found: %r (see UEWalkerConfig)", USMAP_PATH)
+        raise ToolError(f"USMAP_PATH not found: {USMAP_PATH!r}")
 
 
 def dxgi_of(pixel_format: str) -> int:
@@ -611,8 +616,13 @@ class CUE4Parse:
             clr.AddReference(dll.stem)
 
             from CUE4Parse.Compression import OodleHelper  # noqa: PLC0415
+            from CUE4Parse.Encryption.Aes import FAesKey  # noqa: PLC0415
             from CUE4Parse.FileProvider import DefaultFileProvider  # noqa: PLC0415
+            from CUE4Parse.MappingsProvider.Usmap import (  # noqa: PLC0415
+                FileUsmapTypeMappingsProvider,
+            )
             from CUE4Parse.UE4.Assets.Exports.Texture import UTexture2D  # noqa: PLC0415
+            from CUE4Parse.UE4.Objects.Core.Misc import FGuid  # noqa: PLC0415
             from CUE4Parse.UE4.Versions import EGame, VersionContainer  # noqa: PLC0415
             from System.IO import DirectoryInfo, SearchOption  # noqa: PLC0415
 
@@ -638,14 +648,73 @@ class CUE4Parse:
 
         cls._types = {
             "DefaultFileProvider": DefaultFileProvider,
+            "FileUsmapTypeMappingsProvider": FileUsmapTypeMappingsProvider,
             "UTexture2D": UTexture2D,
             "VersionContainer": VersionContainer,
             "EGame": EGame,
+            "FAesKey": FAesKey,
+            "FGuid": FGuid,
             "SearchOption": SearchOption,
             "DirectoryInfo": DirectoryInfo,
             "OodleHelper": OodleHelper,
         }
         return cls._types
+
+
+_mappings = None
+
+
+def mappings_container():
+    """
+    The parsed `USMAP_PATH`, loaded once and shared by every provider. None when unset.
+
+    A package cooked with unversioned properties names its properties by index, and
+    only the mappings turn those back into names; without them CUE4Parse raises
+    `MappingException` and the asset is skipped. The file is parsed on first use and
+    kept, since a walk mounts one provider per container and the parse is not free.
+    """
+    global _mappings
+    if not USMAP_PATH:
+        return None
+    if _mappings is None:
+        t = CUE4Parse.types()
+        # The ctor parses the file, so a wrong-version or truncated dump raises here.
+        # Fatal, like a missing binary: every container after it would raise the same.
+        try:
+            _mappings = t["FileUsmapTypeMappingsProvider"](str(Path(USMAP_PATH).resolve()))
+        except Exception as exc:
+            # A CLR exception stringifies with its whole .NET stack; the first line
+            # is the message ("Usmap has invalid magic"), the rest is noise here.
+            why = str(exc).splitlines()[0]
+            log.error("cannot parse type mappings %r: %s", USMAP_PATH, why)
+            raise ToolError(f"cannot parse USMAP_PATH {USMAP_PATH!r}: {why}") from exc
+        log.debug("loaded type mappings from %s", USMAP_PATH)
+    return _mappings
+
+
+def submit_aes_key(provider) -> None:
+    """
+    Hand `AES_KEY` to an initialised provider, for every GUID that asks for one.
+
+    CUE4Parse keys a container by the encryption GUID in its header, so a key goes in
+    as an `(FGuid, FAesKey)` pair; a bare string matches no overload. Almost every
+    container names the zero GUID and is unlocked by the game's single key, so that
+    one is always offered. A container naming a GUID of its own is offered the same
+    key, there being only one configured. No-op when no key is set.
+
+    Call between `Initialize` and `Mount`: the GUIDs are read out of the container
+    headers by the first, and nothing encrypted can be read until the second.
+    """
+    if not AES_KEY:
+        return
+    t = CUE4Parse.types()
+    key = t["FAesKey"](AES_KEY)  # accepts the hex string with or without `0x`
+    guids = {"0" * 32: t["FGuid"](0)}
+    for guid in provider.RequiredKeys:  # collected before submitting; submitting mounts
+        guids.setdefault(str(guid), guid)
+    log.debug("submitting AES key for %d GUID(s)", len(guids))
+    for guid in guids.values():
+        provider.SubmitKey(guid, key)
 
 
 class TextureDecoder:
@@ -699,8 +768,10 @@ class TextureDecoder:
                     directory, t["SearchOption"].AllDirectories, True, versions
                 )
             provider.Initialize()
-            if AES_KEY:
-                provider.SubmitKey(AES_KEY)
+            submit_aes_key(provider)
+            # Mappings are a property of the provider, not of a load: set before the
+            # mount, so the first package read is already able to name its properties.
+            provider.MappingsContainer = mappings_container()
             provider.Mount()
             log.debug("mounted CUE4Parse provider at %s", self.mount)
             self._provider = provider
