@@ -2,8 +2,9 @@
 Walk an Unreal Engine mod folder and yield every editable texture inside it.
 
 Descends recursively: mod root -> .7z archives -> UE containers (.pak / .utoc+.ucas)
--> cooked Zen assets -> decoded .dds. Only the .7z layer is unpacked (py7zr); a UE
-container is mounted through CUE4Parse and read in place, so no cooked tree is written
+-> cooked Zen assets -> decoded .dds. Containers lying loose in the mod root, with no
+archive around them, are walked the same way. Only the .7z layer is unpacked (py7zr); a
+UE container is mounted through CUE4Parse and read in place, so no cooked tree is written
 and no external binary is run. Yielded files are temporary: they live in the
 walk's scratch tree and each dies as the next one is produced. `EDIT_ROOT_DIR` belongs to
 the consumer: it writes its edited textures there under the yielded relative path, and
@@ -550,6 +551,28 @@ class SevenZipSource:
             z.extract(path=dest, targets=targets)
 
 
+class DiskSource:
+    """
+    Container set lying loose in the mod folder, with no archive around it.
+
+    Nothing is copied: the set's members are symlinked into a directory of their own,
+    and that is what gets mounted. A provider indexes every container in the directory
+    it is handed, so pointing it at the mod folder itself would pull in every unrelated
+    container beside this one, breaking the one-set-at-a-time mount the walk relies on.
+    Member names are paths relative to the mod root, and the link tree mirrors them.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def extract(self, members: list[str], dest: Path) -> None:
+        log.debug("linking %d member(s) from %s -> %s", len(members), self.root, dest)
+        for member in members:
+            link = dest / member
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(self.root / member)
+
+
 class CUE4Parse:
     """
     Lazily loaded handle on the CUE4Parse assembly.
@@ -1034,6 +1057,14 @@ class ModWalker:
     # -- layer 1: the mod folder on disk -------------------------------------
 
     def _walk_disk(self) -> Iterator[WalkItem]:
+        """
+        Walk the mod folder: its archives and loose images, then its loose containers.
+
+        A container found on disk is collected rather than walked where it is met,
+        since a set only mounts whole and its members can be met in any order. Grouping
+        is the archive layer's, keyed on directory and patch family alike.
+        """
+        loose: list[str] = []
         for child in sorted(self.root.rglob("*")):
             if not child.is_file():
                 continue
@@ -1048,8 +1079,15 @@ class ModWalker:
             if child.suffix.lower() in SEVENZIP_EXTS:
                 with self._guard(rel):
                     yield from self._walk_7z(child, archive_segment(rel))
+            elif ext_of(rel) in UE_EXTS:
+                loose.append(rel)
             elif is_image(child.name):
                 yield from self._deliver(child, rel)
+
+        source = DiskSource(self.root)
+        for group in group_ue_members(loose):
+            with self._guard(group.segment):
+                yield from self._walk_ue_group(source, group, "")
 
     # -- layer 2: a .7z archive ----------------------------------------------
 
@@ -1078,10 +1116,10 @@ class ModWalker:
                 yield from self._walk_ue_group(source, group, prefix)
 
     def _walk_ue_group(
-        self, source: SevenZipSource, group: UEContainerSet, prefix: str
+        self, source: SevenZipSource | DiskSource, group: UEContainerSet, prefix: str
     ) -> Iterator[WalkItem]:
         """
-        Materialise one container set out of the .7z, then decode straight out of it.
+        Materialise one container set out of its source, then decode straight out of it.
 
         The marker is checked first and written last, so a container is extracted at
         most once across all walks: hundreds of megabytes of payload for a set whose
@@ -1098,10 +1136,11 @@ class ModWalker:
             return
 
         log.info("container %s", set_prefix)
-        # The triplet is temp-only: the mod already holds it, and the patch pass
-        # re-extracts the one container it needs. It has to outlive the decode, though,
-        # since the decoder reads the container directly rather than an unpacked tree.
-        # Still one container's worth at a time.
+        # The triplet is temp-only: the mod already holds it (as archive members, or
+        # as the files these are links to), and the patch pass re-extracts the one
+        # container it needs. It has to outlive the decode, though, since the decoder
+        # reads the container directly rather than an unpacked tree. Still one
+        # container's worth at a time.
         set_dir = Path(tempfile.mkdtemp(dir=self.tmp_root))
         failed = self._failed
         try:

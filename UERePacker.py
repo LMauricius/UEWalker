@@ -1,3 +1,5 @@
+#!/usr/local/bin/python3
+
 """
 Pack the textures edited in `EDIT_ROOT_DIR` back into patch containers under `PATCH_ROOT_DIR`.
 
@@ -673,7 +675,9 @@ class ModRepacker:
             "--game-dir", str(game_dir),
             "--content-path", str(content),
             "--engine-version", REZEN_VERSION,
-            "--compression-format", PATCH_COMPRESSION,
+            # `PATCH_COMPRESSION = None` in an ini reads back as Python None, and the
+            # packer spells "no compression" as the literal string.
+            "--compression-format", PATCH_COMPRESSION or "None",
             "--output-path", str(target),
         ]
         if AES_KEY:
