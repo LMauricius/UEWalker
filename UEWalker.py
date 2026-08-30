@@ -8,9 +8,9 @@ UE container is mounted through CUE4Parse and read in place, so no cooked tree i
 and no external binary is run. Yielded files are temporary: they live in the
 walk's scratch tree and each dies as the next one is produced. `EDIT_ROOT_DIR` belongs to
 the consumer: it writes its edited textures there under the yielded relative path, and
-the walker follows behind, keeping only what an edit makes worth keeping -- the cooked
-package it came from (into `UASSET_DIR`, whose tree mirrors the edit tree), and
-optionally a `backup-` copy of the original. Edits are turned
+the walker follows behind, keeping what an edit makes worth keeping -- the cooked
+package it came from (into `UASSET_DIR`, whose tree mirrors the edit tree) -- plus,
+optionally, a `backup-` copy of every original it hands over. Edits are turned
 into patch containers later, by a separate pass; nothing unedited is ever stored.
 See `ModWalker` / `fileIterator` for the public entry points.
 """
@@ -1019,9 +1019,10 @@ class ModWalker:
     The walker follows behind it. Every texture gets its `.dds.json` sidecar, and a
     container handed over whole gets a `.uewalker-done` marker; beyond that, only an
     edit makes anything worth storing. When one appears, the cooked package it was
-    decoded from is written under `asset_root_dir`, whose tree mirrors the edit one,
-    and with `backup` on the untouched original is kept beside the edit as
-    `backup-<name>`. An unedited texture costs nothing but its sidecar.
+    decoded from is written under `asset_root_dir`, whose tree mirrors the edit one.
+    With `backup` on, the untouched original is kept as `backup-<name>` beside where
+    the edit goes, edited or not. An unedited texture otherwise costs nothing but its
+    sidecar.
 
     With `skip_existing` on, `edit_root_dir` is read back as the record of previous walks.
     A container whose marker is there is skipped before its payload leaves the
@@ -1385,21 +1386,26 @@ class ModWalker:
         save_cooked: Callable[[], None] | None,
     ) -> None:
         """
-        Keep what the consumer's edit made worth keeping, and nothing else.
+        Keep what the consumer's edit made worth keeping, plus the backup.
 
-        The edit appearing at `rel` is the signal: everything is a patch, so an
-        untouched texture must leave nothing behind but its sidecar. The container is
-        still mounted and its triplet still on disk at this point (a generator resumes
-        innermost first, so this runs before the walk unwinds out of the container),
-        which is what lets the cooked package be pulled now instead of re-extracted
-        from the mod months later.
+        The edit appearing at `rel` is the signal for the cooked package: everything
+        is a patch, so an untouched texture leaves nothing behind but its sidecar and,
+        with `backup` on, its `backup-` copy. That copy is not edit-gated: the scratch
+        file dies with the next delivery, so this is the only point at which an
+        untouched original can still be kept.
+
+        The container is still mounted and its triplet still on disk at this point (a
+        generator resumes innermost first, so this runs before the walk unwinds out of
+        the container), which is what lets the cooked package be pulled now instead of
+        re-extracted from the mod months later.
         """
-        if not (self.out / rel).is_file():
-            log.debug("%s: not edited, nothing to keep", rel)
-            return
-        log.info("harvesting %s", rel)
+        # Backup first: it is wanted whether or not the consumer wrote anything.
         if self.backup and not in_place:
             self._backup(path, rel)
+        if not (self.out / rel).is_file():
+            log.debug("%s: not edited, no cooked package kept", rel)
+            return
+        log.info("harvesting %s", rel)
         if save_cooked is not None:
             save_cooked()
 
